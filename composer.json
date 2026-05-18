@@ -1,11 +1,15 @@
 {
     "$schema": "https://getcomposer.org/schema.json",
     "name": "laravel/laravel",
-    "type": "project",
-    "description": "The skeleton application for the Laravel framework.",
+    "type": "microservice-notifications",
+    "description": "Notification microservice",
     "keywords": [
         "laravel",
-        "framework"
+        "framework",
+        "microservice",
+        "kafka",
+        "redis",
+        "notifications"
     ],
     "license": "MIT",
     "require": {
