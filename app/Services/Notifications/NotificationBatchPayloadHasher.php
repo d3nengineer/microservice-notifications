@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace App\Support;
+namespace App\Services\Notifications;
 
 use App\DTO\CreateNotificationBatchDTO;
 

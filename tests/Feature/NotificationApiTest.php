@@ -7,9 +7,11 @@ namespace Tests\Feature;
 use App\Enums\NotificationChannel;
 use App\Enums\NotificationPriority;
 use App\Enums\NotificationStatus;
+use App\Enums\OutboxMessageStatus;
 use App\Models\IdempotencyKey;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
+use App\Models\OutboxMessage;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -50,6 +52,36 @@ class NotificationApiTest extends TestCase
         ]);
 
         $this->assertDatabaseCount('notifications', 2);
+        $this->assertDatabaseCount('outbox_messages', 2);
+
+        $notifications = Notification::query()
+            ->where('batch_id', $response->json('data.batch_id'))
+            ->orderBy('recipient_id')
+            ->get();
+
+        $outboxMessages = OutboxMessage::query()
+            ->where('aggregate_type', Notification::class)
+            ->orderBy('aggregate_id')
+            ->get();
+
+        $this->assertSame(
+            $notifications->pluck('id')->sort()->values()->all(),
+            $outboxMessages->pluck('aggregate_id')->sort()->values()->all()
+        );
+
+        $firstOutboxMessage = $outboxMessages->first();
+
+        $this->assertNotNull($firstOutboxMessage);
+        $this->assertIsArray($firstOutboxMessage->payload);
+
+        $payload = $firstOutboxMessage->payload;
+
+        $this->assertSame('notifications.high', $firstOutboxMessage->topic);
+        $this->assertSame(OutboxMessageStatus::Pending, $firstOutboxMessage->status);
+        $this->assertSame(0, $firstOutboxMessage->attempts);
+        $this->assertSame(NotificationChannel::Email->value, $payload['channel']);
+        $this->assertSame(NotificationPriority::High->value, $payload['priority']);
+        $this->assertSame(1, $payload['attempt']);
 
         /** @var IdempotencyKey $idempotencyKey */
         $idempotencyKey = IdempotencyKey::query()
@@ -80,6 +112,7 @@ class NotificationApiTest extends TestCase
         $this->assertSame($firstResponse->json(), $secondResponse->json());
         $this->assertDatabaseCount('notification_batches', 1);
         $this->assertDatabaseCount('notifications', 2);
+        $this->assertDatabaseCount('outbox_messages', 2);
         $this->assertDatabaseCount('idempotency_keys', 1);
     }
 
@@ -107,6 +140,7 @@ class NotificationApiTest extends TestCase
 
         $this->assertDatabaseCount('notification_batches', 1);
         $this->assertDatabaseCount('notifications', 2);
+        $this->assertDatabaseCount('outbox_messages', 2);
         $this->assertDatabaseCount('idempotency_keys', 1);
     }
 
@@ -136,6 +170,7 @@ class NotificationApiTest extends TestCase
 
         $this->assertDatabaseCount('notification_batches', 0);
         $this->assertDatabaseCount('notifications', 0);
+        $this->assertDatabaseCount('outbox_messages', 0);
         $this->assertDatabaseCount('idempotency_keys', 0);
     }
 
