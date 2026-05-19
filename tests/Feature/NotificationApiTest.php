@@ -7,9 +7,11 @@ namespace Tests\Feature;
 use App\Enums\NotificationChannel;
 use App\Enums\NotificationPriority;
 use App\Enums\NotificationStatus;
+use App\Models\IdempotencyKey;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
@@ -48,6 +50,93 @@ class NotificationApiTest extends TestCase
         ]);
 
         $this->assertDatabaseCount('notifications', 2);
+
+        /** @var IdempotencyKey $idempotencyKey */
+        $idempotencyKey = IdempotencyKey::query()
+            ->where('key', 'request-2026-05-18-001')
+            ->firstOrFail();
+
+        $this->assertSame($response->json(), $idempotencyKey->response_body);
+        $this->assertSame(201, $idempotencyKey->response_status);
+        $this->assertSame($response->json('data.batch_id'), $idempotencyKey->notification_batch_id);
+    }
+
+    public function test_batch_creation_replays_identical_idempotent_request(): void
+    {
+        $payload = [
+            'channel' => NotificationChannel::Email->value,
+            'message' => 'Your verification code is 1234',
+            'recipient_ids' => ['subscriber-1', 'subscriber-2'],
+            'priority' => NotificationPriority::High->value,
+        ];
+        $headers = ['Idempotency-Key' => 'request-replay-001'];
+
+        $firstResponse = $this->postJson(route('api.v1.notification-batches.store'), $payload, $headers);
+        $secondResponse = $this->postJson(route('api.v1.notification-batches.store'), $payload, $headers);
+
+        $firstResponse->assertCreated();
+        $secondResponse->assertCreated();
+
+        $this->assertSame($firstResponse->json(), $secondResponse->json());
+        $this->assertDatabaseCount('notification_batches', 1);
+        $this->assertDatabaseCount('notifications', 2);
+        $this->assertDatabaseCount('idempotency_keys', 1);
+    }
+
+    public function test_batch_creation_rejects_reused_idempotency_key_with_different_payload(): void
+    {
+        $payload = [
+            'channel' => NotificationChannel::Email->value,
+            'message' => 'Your verification code is 1234',
+            'recipient_ids' => ['subscriber-1', 'subscriber-2'],
+            'priority' => NotificationPriority::High->value,
+        ];
+        $headers = ['Idempotency-Key' => 'request-conflict-001'];
+
+        $this->postJson(route('api.v1.notification-batches.store'), $payload, $headers)
+            ->assertCreated();
+
+        $response = $this->postJson(route('api.v1.notification-batches.store'), [
+            ...$payload,
+            'message' => 'Your verification code is 5678',
+        ], $headers);
+
+        $response
+            ->assertConflict()
+            ->assertJsonPath('error', 'idempotency_key_conflict');
+
+        $this->assertDatabaseCount('notification_batches', 1);
+        $this->assertDatabaseCount('notifications', 2);
+        $this->assertDatabaseCount('idempotency_keys', 1);
+    }
+
+    public function test_batch_creation_returns_locked_response_when_idempotency_lock_is_busy(): void
+    {
+        $idempotencyKey = 'request-locked-001';
+        $lock = Cache::lock('notification-batches:idempotency:'.hash('sha256', $idempotencyKey), 10);
+
+        $this->assertTrue($lock->get());
+
+        try {
+            $response = $this->postJson(route('api.v1.notification-batches.store'), [
+                'channel' => NotificationChannel::Email->value,
+                'message' => 'Your verification code is 1234',
+                'recipient_ids' => ['subscriber-1'],
+                'priority' => NotificationPriority::Normal->value,
+            ], [
+                'Idempotency-Key' => $idempotencyKey,
+            ]);
+        } finally {
+            $lock->release();
+        }
+
+        $response
+            ->assertStatus(423)
+            ->assertJsonPath('error', 'idempotency_key_locked');
+
+        $this->assertDatabaseCount('notification_batches', 0);
+        $this->assertDatabaseCount('notifications', 0);
+        $this->assertDatabaseCount('idempotency_keys', 0);
     }
 
     /**

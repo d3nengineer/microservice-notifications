@@ -6,11 +6,13 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Actions\CreateNotificationBatch;
 use App\DTO\CreateNotificationBatchDTO;
+use App\Exceptions\IdempotencyConflictException;
+use App\Exceptions\IdempotencyLockTimeoutException;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\StoreNotificationBatchRequest;
-use App\Http\Resources\NotificationBatchResource;
 use Illuminate\Http\JsonResponse;
 use OpenApi\Attributes as OA;
+use Symfony\Component\HttpFoundation\Response;
 
 class NotificationBatchController extends Controller
 {
@@ -38,6 +40,16 @@ class NotificationBatchController extends Controller
                 content: new OA\JsonContent(ref: '#/components/schemas/NotificationBatchResponse'),
             ),
             new OA\Response(
+                response: 409,
+                description: 'Idempotency key conflict.',
+                content: new OA\JsonContent(ref: '#/components/schemas/GenericError'),
+            ),
+            new OA\Response(
+                response: 423,
+                description: 'Idempotency key is currently locked.',
+                content: new OA\JsonContent(ref: '#/components/schemas/GenericError'),
+            ),
+            new OA\Response(
                 response: 422,
                 description: 'Validation failed.',
                 content: new OA\JsonContent(ref: '#/components/schemas/ValidationError'),
@@ -55,10 +67,20 @@ class NotificationBatchController extends Controller
         $validated = $request->validated();
         $data = CreateNotificationBatchDTO::fromArray($validated);
 
-        $batch = $createNotificationBatch($data);
+        try {
+            $result = $createNotificationBatch($data, $request);
+        } catch (IdempotencyConflictException) {
+            return response()->json([
+                'message' => 'The Idempotency-Key has already been used with a different payload.',
+                'error' => 'idempotency_key_conflict',
+            ], Response::HTTP_CONFLICT);
+        } catch (IdempotencyLockTimeoutException) {
+            return response()->json([
+                'message' => 'Another request is already processing this Idempotency-Key.',
+                'error' => 'idempotency_key_locked',
+            ], Response::HTTP_LOCKED);
+        }
 
-        return (new NotificationBatchResource($batch))
-            ->response()
-            ->setStatusCode(201);
+        return response()->json($result->responseBody, $result->responseStatus);
     }
 }
