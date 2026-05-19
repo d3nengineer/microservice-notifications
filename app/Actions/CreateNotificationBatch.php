@@ -8,12 +8,22 @@ use App\DTO\CreateNotificationBatchDTO;
 use App\Enums\NotificationStatus;
 use App\Models\NotificationBatch;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class CreateNotificationBatch
 {
     public function __invoke(CreateNotificationBatchDTO $data): NotificationBatch
     {
-        return DB::transaction(function () use ($data): NotificationBatch {
+        Log::info('Notification batch creation started.', [
+            'idempotency_key' => $data->idempotencyKey,
+            'channel' => $data->channel->value,
+            'priority' => $data->priority->value,
+            'recipient_count' => count($data->recipientIds),
+        ]);
+
+        $batch = new NotificationBatch;
+
+        DB::transaction(function () use ($data, &$batch): void {
             $batch = NotificationBatch::create([
                 'channel' => $data->channel,
                 'message' => $data->message,
@@ -36,8 +46,15 @@ class CreateNotificationBatch
                     ->all()
             );
 
-            return $batch->loadCount('notifications');
+            $batch->loadCount('notifications');
         });
+
+        Log::info('Notification batch created.', [
+            'batch_id' => $batch->id,
+            'notifications_count' => $batch->notifications_count,
+        ]);
+
+        return $batch;
     }
 
     private function payloadHash(CreateNotificationBatchDTO $data): string

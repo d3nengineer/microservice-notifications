@@ -9,7 +9,6 @@ use App\DTO\ListSubscriberNotificationsDTO;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\ListSubscriberNotificationsRequest;
 use App\Http\Resources\NotificationCollection;
-use Illuminate\Support\Facades\Log;
 use OpenApi\Attributes as OA;
 
 class SubscriberNotificationController extends Controller
@@ -51,16 +50,6 @@ class SubscriberNotificationController extends Controller
         /** @var array{status?: string, channel?: string, page?: int, per_page?: int} $filters */
         $filters = $request->validated();
         $data = ListSubscriberNotificationsDTO::fromArray($recipientId, $filters, $request->perPage());
-
-        Log::info('Subscriber notification history requested.', [
-            'recipient_id' => $data->recipientId,
-            'filters' => [
-                'status' => $data->status?->value,
-                'channel' => $data->channel?->value,
-            ],
-            'page' => $data->page,
-            'per_page' => $data->perPage,
-        ]);
 
         $notifications = $listSubscriberNotifications($data);
 
