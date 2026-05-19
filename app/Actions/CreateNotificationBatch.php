@@ -5,31 +5,113 @@ declare(strict_types=1);
 namespace App\Actions;
 
 use App\DTO\CreateNotificationBatchDTO;
+use App\DTO\NotificationBatchCreationResult;
 use App\Enums\NotificationStatus;
+use App\Exceptions\IdempotencyConflictException;
+use App\Exceptions\IdempotencyLockTimeoutException;
+use App\Http\Resources\NotificationBatchResource;
+use App\Models\IdempotencyKey;
 use App\Models\NotificationBatch;
+use App\Support\NotificationBatchPayloadHasher;
+use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use LogicException;
+use Throwable;
 
 class CreateNotificationBatch
 {
-    public function __invoke(CreateNotificationBatchDTO $data): NotificationBatch
+    public function __construct(
+        private readonly NotificationBatchPayloadHasher $payloadHasher,
+    ) {}
+
+    public function __invoke(CreateNotificationBatchDTO $data, Request $request): NotificationBatchCreationResult
     {
+        $payloadHash = $this->payloadHasher->payloadHash($data);
+
         Log::info('Notification batch creation started.', [
             'idempotency_key' => $data->idempotencyKey,
+            'payload_hash' => $payloadHash,
             'channel' => $data->channel->value,
             'priority' => $data->priority->value,
             'recipient_count' => count($data->recipientIds),
         ]);
 
-        $batch = new NotificationBatch;
+        $lock = Cache::lock($this->lockName($data->idempotencyKey), 10);
 
-        DB::transaction(function () use ($data, &$batch): void {
+        try {
+            $result = $lock->block(3, fn (): NotificationBatchCreationResult => $this->createOrReplay($data, $payloadHash, $request));
+        } catch (LockTimeoutException) {
+            Log::warning('Idempotency lock acquisition timed out.', [
+                'idempotency_key' => $data->idempotencyKey,
+                'payload_hash' => $payloadHash,
+            ]);
+
+            throw new IdempotencyLockTimeoutException($data->idempotencyKey, $payloadHash);
+        } catch (Throwable $exception) {
+            if ($exception instanceof IdempotencyConflictException) {
+                throw $exception;
+            }
+
+            Log::error('Notification batch idempotent creation failed.', [
+                'idempotency_key' => $data->idempotencyKey,
+                'payload_hash' => $payloadHash,
+                'exception' => $exception::class,
+            ]);
+
+            throw $exception;
+        }
+
+        if (! $result instanceof NotificationBatchCreationResult) {
+            throw new LogicException('Idempotent notification batch creation returned an unexpected result.');
+        }
+
+        return $result;
+    }
+
+    private function createOrReplay(
+        CreateNotificationBatchDTO $data,
+        string $payloadHash,
+        Request $request,
+    ): NotificationBatchCreationResult {
+        $existingIdempotencyKey = IdempotencyKey::query()
+            ->where('key', $data->idempotencyKey)
+            ->first();
+
+        if ($existingIdempotencyKey !== null) {
+            if ($existingIdempotencyKey->payload_hash !== $payloadHash) {
+                Log::warning('Idempotency payload hash conflict detected.', [
+                    'idempotency_key' => $data->idempotencyKey,
+                    'payload_hash' => $payloadHash,
+                    'existing_payload_hash' => $existingIdempotencyKey->payload_hash,
+                ]);
+
+                throw new IdempotencyConflictException($data->idempotencyKey, $payloadHash);
+            }
+
+            if ($existingIdempotencyKey->response_body !== null && $existingIdempotencyKey->response_status !== null) {
+                Log::info('Notification batch creation replayed from idempotency store.', [
+                    'idempotency_key' => $data->idempotencyKey,
+                    'payload_hash' => $payloadHash,
+                    'batch_id' => $existingIdempotencyKey->notification_batch_id,
+                ]);
+
+                return new NotificationBatchCreationResult(
+                    responseBody: $existingIdempotencyKey->response_body,
+                    responseStatus: $existingIdempotencyKey->response_status,
+                );
+            }
+        }
+
+        $result = DB::transaction(function () use ($data, $payloadHash, $request): NotificationBatchCreationResult {
             $batch = NotificationBatch::create([
                 'channel' => $data->channel,
                 'message' => $data->message,
                 'priority' => $data->priority,
                 'idempotency_key' => $data->idempotencyKey,
-                'payload_hash' => $this->payloadHash($data),
+                'payload_hash' => $payloadHash,
                 'status' => NotificationStatus::Queued,
             ]);
 
@@ -41,34 +123,49 @@ class CreateNotificationBatch
                         'message' => $data->message,
                         'priority' => $data->priority,
                         'status' => NotificationStatus::Queued,
-                        'deduplication_key' => $this->deduplicationKey($data->idempotencyKey, $recipientId),
+                        'deduplication_key' => $this->payloadHasher->deduplicationKey($data->idempotencyKey, $recipientId),
                     ])
                     ->all()
             );
 
             $batch->loadCount('notifications');
+
+            $responseBody = [
+                'data' => (new NotificationBatchResource($batch))->resolve($request),
+            ];
+
+            IdempotencyKey::query()->updateOrCreate([
+                'key' => $data->idempotencyKey,
+            ], [
+                'payload_hash' => $payloadHash,
+                'notification_batch_id' => $batch->id,
+                'response_body' => $responseBody,
+                'response_status' => 201,
+            ]);
+
+            Log::info('Notification batch idempotency record stored.', [
+                'idempotency_key' => $data->idempotencyKey,
+                'payload_hash' => $payloadHash,
+                'batch_id' => $batch->id,
+            ]);
+
+            Log::info('Notification batch created.', [
+                'batch_id' => $batch->id,
+                'notifications_count' => $batch->notifications_count,
+            ]);
+
+            return new NotificationBatchCreationResult($responseBody, 201);
         });
 
-        Log::info('Notification batch created.', [
-            'batch_id' => $batch->id,
-            'notifications_count' => $batch->notifications_count,
-        ]);
+        if (! $result instanceof NotificationBatchCreationResult) {
+            throw new LogicException('Notification batch transaction returned an unexpected result.');
+        }
 
-        return $batch;
+        return $result;
     }
 
-    private function payloadHash(CreateNotificationBatchDTO $data): string
+    private function lockName(string $idempotencyKey): string
     {
-        return hash('sha256', json_encode([
-            'channel' => $data->channel->value,
-            'message' => $data->message,
-            'priority' => $data->priority->value,
-            'recipient_ids' => $data->recipientIds,
-        ], JSON_THROW_ON_ERROR));
-    }
-
-    private function deduplicationKey(string $idempotencyKey, string $recipientId): string
-    {
-        return hash('sha256', $idempotencyKey.'|'.$recipientId);
+        return 'notification-batches:idempotency:'.hash('sha256', $idempotencyKey);
     }
 }

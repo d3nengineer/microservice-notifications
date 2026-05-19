@@ -14,6 +14,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
 
 /**
  * @property int $id
@@ -59,5 +60,24 @@ class Notification extends Model
     public function deliveryAttempts(): HasMany
     {
         return $this->hasMany(DeliveryAttempt::class);
+    }
+
+    public function canBeSent(): bool
+    {
+        $canBeSent = ! in_array($this->status, [
+            NotificationStatus::Sent,
+            NotificationStatus::Delivered,
+            NotificationStatus::Dropped,
+        ], true);
+
+        if (! $canBeSent) {
+            Log::info('Notification send skipped because status is final.', [
+                'notification_id' => $this->id,
+                'status' => $this->status->value,
+                'deduplication_key_hash' => hash('sha256', $this->deduplication_key),
+            ]);
+        }
+
+        return $canBeSent;
     }
 }
