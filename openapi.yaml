@@ -1,0 +1,311 @@
+openapi: 3.1.0
+info:
+  title: 'Notification Service API'
+  description: 'Versioned JSON API for creating notification batches and reading subscriber notification history.'
+  version: 1.0.0
+servers:
+  -
+    url: /api/v1
+    description: 'API v1'
+paths:
+  /notification-batches:
+    post:
+      summary: 'Create a notification batch'
+      operationId: createNotificationBatch
+      parameters:
+        -
+          name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 255
+          example: request-2026-05-18-001
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoreNotificationBatchRequest'
+      responses:
+        '201':
+          description: 'Notification batch created.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationBatchResponse'
+        '422':
+          description: 'Validation failed.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '500':
+          description: 'Server error.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericError'
+  '/subscribers/{recipientId}/notifications':
+    get:
+      summary: 'List subscriber notification history'
+      operationId: listSubscriberNotifications
+      parameters:
+        -
+          $ref: '#/components/parameters/SubscriberRecipientId'
+        -
+          $ref: '#/components/parameters/NotificationStatusFilter'
+        -
+          $ref: '#/components/parameters/NotificationChannelFilter'
+        -
+          $ref: '#/components/parameters/PaginationPage'
+        -
+          $ref: '#/components/parameters/PaginationPerPage'
+      responses:
+        '200':
+          description: 'Paginated notification history.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedNotifications'
+        '422':
+          description: 'Validation failed.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '500':
+          description: 'Server error.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericError'
+components:
+  schemas:
+    StoreNotificationBatchRequest:
+      required:
+        - channel
+        - message
+        - recipient_ids
+        - priority
+      properties:
+        channel:
+          $ref: '#/components/schemas/NotificationChannel'
+        message:
+          type: string
+          example: 'Your verification code is 1234'
+          maxLength: 5000
+          minLength: 1
+        recipient_ids:
+          type: array
+          items:
+            type: string
+            maxLength: 255
+          example:
+            - subscriber-1
+            - subscriber-2
+          maxItems: 1000
+          minItems: 1
+          uniqueItems: true
+        priority:
+          $ref: '#/components/schemas/NotificationPriority'
+      type: object
+    NotificationBatchResource:
+      required:
+        - batch_id
+        - notifications_count
+        - status
+      properties:
+        batch_id:
+          type: integer
+          example: 1
+        notifications_count:
+          type: integer
+          example: 2
+        status:
+          $ref: '#/components/schemas/NotificationStatus'
+      type: object
+    NotificationBatchResponse:
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/NotificationBatchResource'
+      type: object
+    PaginatedNotifications:
+      required:
+        - data
+        - links
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationResource'
+        links:
+          required:
+            - first
+            - last
+            - prev
+            - next
+          properties:
+            first:
+              type:
+                - string
+                - 'null'
+              format: uri
+            last:
+              type:
+                - string
+                - 'null'
+              format: uri
+            prev:
+              type:
+                - string
+                - 'null'
+              format: uri
+            next:
+              type:
+                - string
+                - 'null'
+              format: uri
+          type: object
+        meta:
+          properties:
+            current_page:
+              type: integer
+            from:
+              type:
+                - integer
+                - 'null'
+            last_page:
+              type: integer
+            path:
+              type: string
+            per_page:
+              type: integer
+            to:
+              type:
+                - integer
+                - 'null'
+            total:
+              type: integer
+          type: object
+      type: object
+    NotificationResource:
+      required:
+        - id
+        - batch_id
+        - recipient_id
+        - channel
+        - message
+        - priority
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: integer
+          example: 10
+        batch_id:
+          type: integer
+          example: 1
+        recipient_id:
+          type: string
+          example: subscriber-1
+        channel:
+          $ref: '#/components/schemas/NotificationChannel'
+        message:
+          type: string
+          example: 'Your verification code is 1234'
+        priority:
+          $ref: '#/components/schemas/NotificationPriority'
+        status:
+          $ref: '#/components/schemas/NotificationStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      type: object
+    NotificationChannel:
+      type: string
+      enum:
+        - email
+        - sms
+    NotificationPriority:
+      type: string
+      enum:
+        - high
+        - normal
+        - low
+    NotificationStatus:
+      type: string
+      enum:
+        - queued
+        - sent
+        - delivered
+        - dropped
+    ValidationError:
+      required:
+        - message
+        - errors
+      properties:
+        message:
+          type: string
+          example: 'The given data was invalid.'
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+      type: object
+    GenericError:
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          example: 'Server Error'
+      type: object
+  parameters:
+    SubscriberRecipientId:
+      name: recipientId
+      in: path
+      description: 'External subscriber identifier.'
+      required: true
+      schema:
+        type: string
+      example: subscriber-1
+    NotificationStatusFilter:
+      name: status
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/NotificationStatus'
+    NotificationChannelFilter:
+      name: channel
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/NotificationChannel'
+    PaginationPage:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+      example: 1
+    PaginationPerPage:
+      name: per_page
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 15
+        maximum: 100
+        minimum: 1
+      example: 15
