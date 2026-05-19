@@ -10,9 +10,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\StoreNotificationBatchRequest;
 use App\Http\Resources\NotificationBatchResource;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Log;
 use OpenApi\Attributes as OA;
-use Throwable;
 
 class NotificationBatchController extends Controller
 {
@@ -57,32 +55,7 @@ class NotificationBatchController extends Controller
         $validated = $request->validated();
         $data = CreateNotificationBatchDTO::fromArray($validated);
 
-        Log::info('Notification batch creation requested.', [
-            'idempotency_key' => $data->idempotencyKey,
-            'channel' => $data->channel->value,
-            'priority' => $data->priority->value,
-            'recipient_count' => count($data->recipientIds),
-        ]);
-
-        try {
-            $batch = $createNotificationBatch($data);
-        } catch (Throwable $exception) {
-            Log::error('Notification batch creation failed.', [
-                'idempotency_key' => $data->idempotencyKey,
-                'channel' => $data->channel->value,
-                'priority' => $data->priority->value,
-                'recipient_count' => count($data->recipientIds),
-                'exception' => $exception::class,
-                'exception_code' => $exception->getCode(),
-            ]);
-
-            throw $exception;
-        }
-
-        Log::info('Notification batch created.', [
-            'batch_id' => $batch->id,
-            'notifications_count' => $batch->notifications_count,
-        ]);
+        $batch = $createNotificationBatch($data);
 
         return (new NotificationBatchResource($batch))
             ->response()

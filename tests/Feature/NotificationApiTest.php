@@ -50,6 +50,10 @@ class NotificationApiTest extends TestCase
         $this->assertDatabaseCount('notifications', 2);
     }
 
+    /**
+     * @param  array<string, mixed>  $payload
+     * @param  array<string, string>  $headers
+     */
     #[DataProvider('invalidBatchPayloadProvider')]
     public function test_batch_creation_rejects_invalid_payloads(array $payload, array $headers, string $errorKey): void
     {
@@ -103,6 +107,7 @@ class NotificationApiTest extends TestCase
 
     public function test_subscriber_history_returns_only_requested_recipient_notifications(): void
     {
+        /** @var Notification $requested */
         $requested = Notification::factory()->create([
             'recipient_id' => 'subscriber-1',
             'message' => 'Requested notification',
@@ -125,6 +130,7 @@ class NotificationApiTest extends TestCase
 
     public function test_subscriber_history_filters_by_status_and_channel(): void
     {
+        /** @var Notification $matching */
         $matching = Notification::factory()->create([
             'recipient_id' => 'subscriber-1',
             'channel' => NotificationChannel::Email,
@@ -168,12 +174,17 @@ class NotificationApiTest extends TestCase
 
     public function test_subscriber_history_is_paginated_and_sorted_newest_first(): void
     {
+        /** @var NotificationBatch $batch */
         $batch = NotificationBatch::factory()->create();
+
+        /** @var Notification $oldest */
         $oldest = Notification::factory()->for($batch, 'batch')->create([
             'recipient_id' => 'subscriber-1',
             'created_at' => now()->subMinutes(3),
             'updated_at' => now()->subMinutes(3),
         ]);
+
+        /** @var Notification $newest */
         $newest = Notification::factory()->for($batch, 'batch')->create([
             'recipient_id' => 'subscriber-1',
             'created_at' => now()->subMinute(),

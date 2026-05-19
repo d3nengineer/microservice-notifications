@@ -28,6 +28,9 @@ class DeliveryAttempt extends Model
         ];
     }
 
+    /**
+     * @return BelongsTo<Notification, $this>
+     */
     public function notification(): BelongsTo
     {
         return $this->belongsTo(Notification::class);

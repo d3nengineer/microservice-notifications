@@ -9,9 +9,6 @@ use App\Enums\NotificationStatus;
 
 readonly class ListSubscriberNotificationsDTO
 {
-    /**
-     * @param  array{status?: string, channel?: string, page?: int, per_page?: int}  $filters
-     */
     public function __construct(
         public string $recipientId,
         public ?NotificationStatus $status,

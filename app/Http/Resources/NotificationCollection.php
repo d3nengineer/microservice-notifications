@@ -4,9 +4,6 @@ declare(strict_types=1);
 
 namespace App\Http\Resources;
 
-use App\Models\Notification;
-use Illuminate\Contracts\Pagination\LengthAwarePaginator;
-use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\ResourceCollection;
 use OpenApi\Attributes as OA;
 
@@ -49,20 +46,4 @@ use OpenApi\Attributes as OA;
 class NotificationCollection extends ResourceCollection
 {
     public $collects = NotificationResource::class;
-
-    /**
-     * @param  LengthAwarePaginator<int, Notification>  $resource
-     */
-    public function __construct(LengthAwarePaginator $resource)
-    {
-        parent::__construct($resource);
-    }
-
-    /**
-     * @return array<int, array<string, mixed>>
-     */
-    public function toArray(Request $request): array
-    {
-        return parent::toArray($request);
-    }
 }
