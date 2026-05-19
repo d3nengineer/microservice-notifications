@@ -1,0 +1,9 @@
+parameters:
+    level: max
+    paths:
+        - app
+        - routes/api.php
+        - routes/web.php
+        - database/factories
+        - tests
+    tmpDir: storage/framework/cache/phpstan

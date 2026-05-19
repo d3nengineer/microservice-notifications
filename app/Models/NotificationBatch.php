@@ -13,7 +13,22 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Support\Carbon;
 
+/**
+ * @property int $id
+ * @property NotificationChannel $channel
+ * @property string $message
+ * @property NotificationPriority $priority
+ * @property string $idempotency_key
+ * @property string $payload_hash
+ * @property NotificationStatus $status
+ * @property Carbon|null $created_at
+ * @property Carbon|null $updated_at
+ * @property-read int|null $notifications_count
+ *
+ * @method static self create(array<string, mixed> $attributes = [])
+ */
 #[Fillable(['channel', 'message', 'priority', 'idempotency_key', 'payload_hash', 'status'])]
 class NotificationBatch extends Model
 {
@@ -32,11 +47,17 @@ class NotificationBatch extends Model
         ];
     }
 
+    /**
+     * @return HasMany<Notification, $this>
+     */
     public function notifications(): HasMany
     {
         return $this->hasMany(Notification::class, 'batch_id');
     }
 
+    /**
+     * @return HasOne<IdempotencyKey, $this>
+     */
     public function idempotencyKey(): HasOne
     {
         return $this->hasOne(IdempotencyKey::class);

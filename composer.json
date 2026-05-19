@@ -25,6 +25,7 @@
         "laravel/pint": "^1.27",
         "mockery/mockery": "^1.6",
         "nunomaduro/collision": "^8.6",
+        "phpstan/phpstan": "^2.1",
         "phpunit/phpunit": "^12.5.12",
         "zircote/swagger-php": "^6.1"
     },
@@ -55,6 +56,20 @@
         ],
         "openapi": [
             "vendor/bin/openapi app --version 3.1.0 -o openapi.yaml"
+        ],
+        "cs-fix": [
+            "vendor/bin/pint --format agent"
+        ],
+        "cs-check": [
+            "vendor/bin/pint --test --format agent"
+        ],
+        "analyse": [
+            "vendor/bin/phpstan analyse --memory-limit=1G --debug"
+        ],
+        "check": [
+            "@cs-check",
+            "@analyse",
+            "@test -- --compact"
         ],
         "test": [
             "@php artisan config:clear --ansi @no_additional_args",

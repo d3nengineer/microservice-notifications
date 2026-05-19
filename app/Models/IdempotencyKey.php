@@ -27,6 +27,9 @@ class IdempotencyKey extends Model
         ];
     }
 
+    /**
+     * @return BelongsTo<NotificationBatch, $this>
+     */
     public function notificationBatch(): BelongsTo
     {
         return $this->belongsTo(NotificationBatch::class);
