@@ -9,8 +9,10 @@ use App\DTO\GatewayResult;
 use App\DTO\KafkaNotificationMessage;
 use App\Enums\DeliveryAttemptStatus;
 use App\Enums\NotificationStatus;
+use App\Enums\OutboxMessageStatus;
 use App\Models\DeliveryAttempt;
 use App\Models\Notification;
+use App\Models\OutboxMessage;
 use App\Services\Kafka\FakeKafkaConsumer;
 use App\Services\Notifications\Gateways\FakeGateway;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -60,6 +62,8 @@ class NotificationConsumerCommandTest extends TestCase
 
     public function test_notifications_consume_command_counts_gateway_outcomes_as_consumed(): void
     {
+        config()->set('notifications.delivery.max_attempts', 3);
+
         $gateway = $this->useFakeGateway();
 
         $consumer = new FakeKafkaConsumer;
@@ -111,6 +115,47 @@ class NotificationConsumerCommandTest extends TestCase
             'notification_id' => $permanentFailureNotification->id,
             'status' => DeliveryAttemptStatus::PermanentlyFailed->value,
         ]);
+        $this->assertDatabaseHas((new OutboxMessage)->getTable(), [
+            'aggregate_type' => Notification::class,
+            'aggregate_id' => $temporaryFailureNotification->id,
+            'status' => OutboxMessageStatus::Pending->value,
+        ]);
+        $this->assertSame(2, OutboxMessage::query()->sole()->payload['attempt']);
+    }
+
+    public function test_notifications_consume_command_drops_exhausted_temporary_failures_without_retry(): void
+    {
+        config()->set('notifications.delivery.max_attempts', 3);
+
+        $gateway = $this->useFakeGateway();
+        $gateway->temporarilyFail(errorCode: 'timeout', errorMessage: 'Gateway timed out.');
+
+        $consumer = new FakeKafkaConsumer;
+        $this->app->instance(KafkaConsumer::class, $consumer);
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->create();
+
+        $consumer->push(new KafkaNotificationMessage(
+            topic: 'notifications.high',
+            payload: $this->validPayload($notification, attempt: 3),
+            key: 'notification:'.$notification->id,
+        ));
+
+        $command = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+
+        $this->assertSame(NotificationStatus::Dropped, $notification->refresh()->status);
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $notification->id,
+            'status' => DeliveryAttemptStatus::TemporaryFailed->value,
+            'attempt_number' => 3,
+        ]);
+        $this->assertDatabaseCount((new OutboxMessage)->getTable(), 0);
     }
 
     public function test_notifications_consume_command_reports_skip_missing_and_invalid_counts(): void
@@ -188,6 +233,7 @@ class NotificationConsumerCommandTest extends TestCase
 
         $this->assertSame(0, $gateway->sendCount($notification->id));
         $this->assertDatabaseCount((new DeliveryAttempt)->getTable(), 1);
+        $this->assertDatabaseCount((new OutboxMessage)->getTable(), 0);
         $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
     }
 

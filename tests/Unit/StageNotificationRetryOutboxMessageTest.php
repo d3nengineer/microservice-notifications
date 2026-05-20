@@ -8,6 +8,7 @@ use App\Enums\NotificationPriority;
 use App\Enums\OutboxMessageStatus;
 use App\Models\Notification;
 use App\Models\OutboxMessage;
+use App\Services\Notifications\NotificationDeliveryRetryPolicy;
 use App\Services\Notifications\StageNotificationRetryOutboxMessage;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
@@ -75,5 +76,27 @@ class StageNotificationRetryOutboxMessageTest extends TestCase
         $this->assertSame('notifications.normal', $outboxMessage->topic);
         $this->assertSame(3, $outboxMessage->payload['attempt']);
         $this->assertTrue($outboxMessage->available_at->equalTo(Carbon::parse('2026-05-20 12:45:00')));
+    }
+
+    public function test_it_stages_retry_with_capped_policy_delay_and_priority_topic(): void
+    {
+        config()->set('notifications.delivery.backoff_seconds', 60);
+        config()->set('notifications.delivery.max_backoff_seconds', 180);
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->highPriority()->create();
+        $now = Carbon::parse('2026-05-20 14:00:00');
+        $delaySeconds = app(NotificationDeliveryRetryPolicy::class)->delaySecondsForAttempt(4);
+
+        $outboxMessage = app(StageNotificationRetryOutboxMessage::class)(
+            notification: $notification,
+            currentAttempt: 4,
+            delaySeconds: $delaySeconds,
+            now: $now,
+        );
+
+        $this->assertSame('notifications.high', $outboxMessage->topic);
+        $this->assertSame(5, $outboxMessage->payload['attempt']);
+        $this->assertTrue($outboxMessage->available_at->equalTo(Carbon::parse('2026-05-20 14:03:00')));
     }
 }

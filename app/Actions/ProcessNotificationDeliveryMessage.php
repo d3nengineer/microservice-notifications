@@ -11,10 +11,13 @@ use App\DTO\NotificationDeliveryProcessingResult;
 use App\Enums\DeliveryAttemptStatus;
 use App\Enums\GatewayResultStatus;
 use App\Enums\NotificationDeliveryProcessingStatus;
+use App\Enums\NotificationStatus;
 use App\Models\DeliveryAttempt;
 use App\Models\Notification;
 use App\Services\Notifications\NotificationDeliveryMessageValidator;
+use App\Services\Notifications\NotificationDeliveryRetryPolicy;
 use App\Services\Notifications\NotificationGatewayResolver;
+use App\Services\Notifications\StageNotificationRetryOutboxMessage;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -25,6 +28,8 @@ class ProcessNotificationDeliveryMessage
     public function __construct(
         private readonly NotificationDeliveryMessageValidator $messageValidator,
         private readonly NotificationGatewayResolver $gatewayResolver,
+        private readonly NotificationDeliveryRetryPolicy $retryPolicy,
+        private readonly StageNotificationRetryOutboxMessage $stageRetryOutboxMessage,
     ) {}
 
     public function __invoke(KafkaNotificationMessage $message): NotificationDeliveryProcessingResult
@@ -174,20 +179,39 @@ class ProcessNotificationDeliveryMessage
         DeliveryAttempt $attempt,
         GatewayResult $gatewayResult,
     ): void {
-        DB::transaction(function () use ($notification, $attempt, $gatewayResult): void {
-            $attempt->update([
-                'gateway' => $gatewayResult->gatewayName,
-                'status' => $this->deliveryAttemptStatus($gatewayResult),
-                'error_code' => $gatewayResult->errorCode,
-                'error_message' => $gatewayResult->errorMessage,
-            ]);
-
-            if ($gatewayResult->targetNotificationStatus !== null) {
-                $notification->update([
-                    'status' => $gatewayResult->targetNotificationStatus,
+        try {
+            DB::transaction(function () use ($notification, $attempt, $gatewayResult): void {
+                $attempt->update([
+                    'gateway' => $gatewayResult->gatewayName,
+                    'status' => $this->deliveryAttemptStatus($gatewayResult),
+                    'error_code' => $gatewayResult->errorCode,
+                    'error_message' => $gatewayResult->errorMessage,
                 ]);
+
+                if ($gatewayResult->targetNotificationStatus !== null) {
+                    $notification->update([
+                        'status' => $gatewayResult->targetNotificationStatus,
+                    ]);
+
+                    Log::info('Notification status transitioned after gateway outcome.', [
+                        'notification_id' => $notification->id,
+                        'attempt' => $attempt->attempt_number,
+                        'status' => $gatewayResult->targetNotificationStatus->value,
+                        'gateway' => $gatewayResult->gatewayName,
+                    ]);
+                }
+
+                if ($gatewayResult->temporarilyFailed()) {
+                    $this->handleTemporaryFailure($notification, $attempt, $gatewayResult);
+                }
+            });
+        } catch (Throwable $exception) {
+            if ($gatewayResult->temporarilyFailed()) {
+                $this->removePendingAttemptAfterRetryPersistenceFailure($attempt, $gatewayResult, $exception);
             }
-        });
+
+            throw $exception;
+        }
 
         $context = [
             'notification_id' => $notification->id,
@@ -212,6 +236,94 @@ class ProcessNotificationDeliveryMessage
             GatewayResultStatus::TemporaryFailed => DeliveryAttemptStatus::TemporaryFailed,
             GatewayResultStatus::PermanentlyFailed => DeliveryAttemptStatus::PermanentlyFailed,
         };
+    }
+
+    private function handleTemporaryFailure(
+        Notification $notification,
+        DeliveryAttempt $attempt,
+        GatewayResult $gatewayResult,
+    ): void {
+        Log::info('Notification temporary gateway failure is being handled.', [
+            'notification_id' => $notification->id,
+            'attempt' => $attempt->attempt_number,
+            'gateway' => $gatewayResult->gatewayName,
+            'error_code' => $gatewayResult->errorCode,
+        ]);
+
+        if ($this->retryPolicy->isExhausted($attempt->attempt_number)) {
+            $notification->update([
+                'status' => NotificationStatus::Dropped,
+            ]);
+
+            Log::warning('Notification temporary gateway failure exhausted retry attempts.', [
+                'notification_id' => $notification->id,
+                'attempt' => $attempt->attempt_number,
+                'gateway' => $gatewayResult->gatewayName,
+                'max_attempts' => $this->retryPolicy->maxAttempts(),
+                'status' => NotificationStatus::Dropped->value,
+            ]);
+
+            return;
+        }
+
+        $delaySeconds = $this->retryPolicy->delaySecondsForAttempt($attempt->attempt_number);
+
+        try {
+            ($this->stageRetryOutboxMessage)(
+                notification: $notification,
+                currentAttempt: $attempt->attempt_number,
+                delaySeconds: $delaySeconds,
+            );
+        } catch (Throwable $exception) {
+            Log::error('Notification retry scheduling failed unexpectedly.', [
+                'notification_id' => $notification->id,
+                'attempt' => $attempt->attempt_number,
+                'gateway' => $gatewayResult->gatewayName,
+                'exception_class' => $exception::class,
+            ]);
+
+            throw $exception;
+        }
+
+        Log::info('Notification retry scheduling completed for temporary gateway failure.', [
+            'notification_id' => $notification->id,
+            'current_attempt' => $attempt->attempt_number,
+            'next_attempt' => $attempt->attempt_number + 1,
+            'gateway' => $gatewayResult->gatewayName,
+            'delay_seconds' => $delaySeconds,
+            'status' => NotificationStatus::Queued->value,
+        ]);
+    }
+
+    private function removePendingAttemptAfterRetryPersistenceFailure(
+        DeliveryAttempt $attempt,
+        GatewayResult $gatewayResult,
+        Throwable $exception,
+    ): void {
+        try {
+            $deletedAttempts = DeliveryAttempt::query()
+                ->whereKey($attempt->id)
+                ->where('status', DeliveryAttemptStatus::Pending)
+                ->delete();
+        } catch (Throwable $cleanupException) {
+            Log::error('Notification pending delivery attempt cleanup failed after retry persistence failure.', [
+                'notification_id' => $attempt->notification_id,
+                'attempt' => $attempt->attempt_number,
+                'gateway' => $gatewayResult->gatewayName,
+                'exception_class' => $exception::class,
+                'cleanup_exception_class' => $cleanupException::class,
+            ]);
+
+            return;
+        }
+
+        Log::warning('Notification pending delivery attempt removed after retry persistence failure.', [
+            'notification_id' => $attempt->notification_id,
+            'attempt' => $attempt->attempt_number,
+            'gateway' => $gatewayResult->gatewayName,
+            'exception_class' => $exception::class,
+            'deleted_attempts' => $deletedAttempts,
+        ]);
     }
 
     private function isUniqueConstraintViolation(QueryException $exception): bool
