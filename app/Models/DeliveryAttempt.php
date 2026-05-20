@@ -10,19 +10,7 @@ use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
-use Illuminate\Support\Carbon;
 
-/**
- * @property int $id
- * @property int $notification_id
- * @property string $gateway
- * @property DeliveryAttemptStatus $status
- * @property int $attempt_number
- * @property string|null $error_code
- * @property string|null $error_message
- * @property Carbon|null $created_at
- * @property Carbon|null $updated_at
- */
 #[Fillable(['notification_id', 'gateway', 'status', 'attempt_number', 'error_code', 'error_message'])]
 class DeliveryAttempt extends Model
 {
