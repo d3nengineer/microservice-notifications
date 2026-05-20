@@ -19,4 +19,13 @@ return [
             'backoff_seconds' => (int) env('NOTIFICATION_OUTBOX_BACKOFF_SECONDS', 60),
         ],
     ],
+
+    'gateways' => [
+        'unavailable_result' => env('NOTIFICATION_GATEWAY_UNAVAILABLE_RESULT', 'temporary_failed'),
+
+        'channels' => [
+            'email' => env('NOTIFICATION_EMAIL_GATEWAY', 'unavailable'),
+            'sms' => env('NOTIFICATION_SMS_GATEWAY', 'unavailable'),
+        ],
+    ],
 ];
