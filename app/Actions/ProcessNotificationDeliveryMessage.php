@@ -8,31 +8,40 @@ use App\DTO\KafkaNotificationMessage;
 use App\DTO\NotificationDeliveryProcessingResult;
 use App\Enums\NotificationDeliveryProcessingStatus;
 use App\Models\Notification;
+use App\Services\Notifications\NotificationDeliveryMessageValidator;
 use Illuminate\Support\Facades\Log;
 
 class ProcessNotificationDeliveryMessage
 {
+    public function __construct(
+        private readonly NotificationDeliveryMessageValidator $messageValidator,
+    ) {}
+
     public function __invoke(KafkaNotificationMessage $message): NotificationDeliveryProcessingResult
     {
-        $notificationId = $message->payload['notification_id'] ?? null;
+        $validationResult = $this->messageValidator->validate($message);
 
-        if (! is_int($notificationId)) {
+        if ($validationResult->isInvalid()) {
             Log::error('Notification delivery message payload is malformed.', [
                 'topic' => $message->topic,
                 'key' => $message->key,
                 'metadata' => $message->metadata,
+                'errors' => $validationResult->invalidFields,
             ]);
 
             return new NotificationDeliveryProcessingResult(
                 status: NotificationDeliveryProcessingStatus::Invalid,
-                reason: 'missing_notification_id',
+                reason: $validationResult->reason,
             );
         }
+
+        $payload = $validationResult->payload();
+        $notificationId = $payload['notification_id'];
 
         Log::info('Notification delivery message processing started.', [
             'topic' => $message->topic,
             'notification_id' => $notificationId,
-            'attempt' => $message->payload['attempt'] ?? null,
+            'attempt' => $payload['attempt'],
         ]);
 
         /** @var Notification|null $notification */

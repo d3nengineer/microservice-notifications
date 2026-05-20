@@ -32,18 +32,12 @@ class NotificationConsumerCommandTest extends TestCase
 
         $consumer->push(new KafkaNotificationMessage(
             topic: 'custom.low',
-            payload: [
-                'notification_id' => $lowPriorityNotification->id,
-                'attempt' => 1,
-            ],
+            payload: $this->validPayload($lowPriorityNotification),
             key: 'notification:'.$lowPriorityNotification->id,
         ));
         $consumer->push(new KafkaNotificationMessage(
             topic: 'custom.high',
-            payload: [
-                'notification_id' => $highPriorityNotification->id,
-                'attempt' => 1,
-            ],
+            payload: $this->validPayload($highPriorityNotification),
             key: 'notification:'.$highPriorityNotification->id,
         ));
 
@@ -67,15 +61,16 @@ class NotificationConsumerCommandTest extends TestCase
 
         $consumer->push(new KafkaNotificationMessage(
             topic: 'notifications.high',
-            payload: [
-                'notification_id' => $deliveredNotification->id,
-                'attempt' => 1,
-            ],
+            payload: $this->validPayload($deliveredNotification),
         ));
         $consumer->push(new KafkaNotificationMessage(
             topic: 'notifications.high',
             payload: [
                 'notification_id' => 999_999,
+                'recipient_id' => 'subscriber-1',
+                'channel' => 'email',
+                'message' => 'Your verification code is 1234',
+                'priority' => 'normal',
                 'attempt' => 1,
             ],
         ));
@@ -108,5 +103,27 @@ class NotificationConsumerCommandTest extends TestCase
             ->run();
 
         $this->assertSame(['notifications.high', 'notifications.normal', 'notifications.low'], $consumer->consumedTopics());
+    }
+
+    /**
+     * @return array{
+     *     notification_id: int,
+     *     recipient_id: string,
+     *     channel: string,
+     *     message: string,
+     *     priority: string,
+     *     attempt: int
+     * }
+     */
+    private function validPayload(Notification $notification, int $attempt = 1): array
+    {
+        return [
+            'notification_id' => $notification->id,
+            'recipient_id' => $notification->recipient_id,
+            'channel' => $notification->channel->value,
+            'message' => $notification->message,
+            'priority' => $notification->priority->value,
+            'attempt' => $attempt,
+        ];
     }
 }
