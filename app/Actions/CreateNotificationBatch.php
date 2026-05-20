@@ -7,13 +7,19 @@ namespace App\Actions;
 use App\DTO\CreateNotificationBatchDTO;
 use App\DTO\NotificationBatchCreationResult;
 use App\Enums\NotificationStatus;
+use App\Enums\OutboxMessageStatus;
 use App\Exceptions\IdempotencyConflictException;
 use App\Exceptions\IdempotencyLockTimeoutException;
 use App\Http\Resources\NotificationBatchResource;
 use App\Models\IdempotencyKey;
+use App\Models\Notification;
 use App\Models\NotificationBatch;
-use App\Support\NotificationBatchPayloadHasher;
+use App\Models\OutboxMessage;
+use App\Services\Notifications\NotificationBatchPayloadHasher;
+use App\Services\Notifications\NotificationKafkaPayloadBuilder;
+use App\Services\Notifications\NotificationKafkaTopicResolver;
 use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -25,6 +31,8 @@ class CreateNotificationBatch
 {
     public function __construct(
         private readonly NotificationBatchPayloadHasher $payloadHasher,
+        private readonly NotificationKafkaTopicResolver $topicResolver,
+        private readonly NotificationKafkaPayloadBuilder $kafkaPayloadBuilder,
     ) {}
 
     public function __invoke(CreateNotificationBatchDTO $data, Request $request): NotificationBatchCreationResult
@@ -128,6 +136,8 @@ class CreateNotificationBatch
                     ->all()
             );
 
+            $topicCounts = $this->stageOutboxMessages($batch);
+
             $batch->loadCount('notifications');
 
             $responseBody = [
@@ -154,6 +164,12 @@ class CreateNotificationBatch
                 'notifications_count' => $batch->notifications_count,
             ]);
 
+            Log::info('Notification outbox messages staged.', [
+                'batch_id' => $batch->id,
+                'notifications_count' => $batch->notifications_count,
+                'topics' => $topicCounts,
+            ]);
+
             return new NotificationBatchCreationResult($responseBody, 201);
         });
 
@@ -167,5 +183,45 @@ class CreateNotificationBatch
     private function lockName(string $idempotencyKey): string
     {
         return 'notification-batches:idempotency:'.hash('sha256', $idempotencyKey);
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    private function stageOutboxMessages(NotificationBatch $batch): array
+    {
+        try {
+            /** @var Collection<int, Notification> $notifications */
+            $notifications = $batch->notifications()
+                ->orderBy('id')
+                ->get();
+
+            $topicCounts = [];
+
+            foreach ($notifications as $notification) {
+                $topic = $this->topicResolver->topicFor($notification->priority);
+
+                OutboxMessage::query()->create([
+                    'aggregate_type' => Notification::class,
+                    'aggregate_id' => $notification->id,
+                    'topic' => $topic,
+                    'payload' => $this->kafkaPayloadBuilder->forNotification($notification),
+                    'status' => OutboxMessageStatus::Pending,
+                    'attempts' => 0,
+                    'available_at' => now(),
+                ]);
+
+                $topicCounts[$topic] = ($topicCounts[$topic] ?? 0) + 1;
+            }
+
+            return $topicCounts;
+        } catch (Throwable $exception) {
+            Log::error('Notification outbox message staging failed.', [
+                'batch_id' => $batch->id,
+                'exception' => $exception::class,
+            ]);
+
+            throw $exception;
+        }
     }
 }

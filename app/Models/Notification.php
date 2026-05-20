@@ -62,6 +62,18 @@ class Notification extends Model
         return $this->hasMany(DeliveryAttempt::class);
     }
 
+    /**
+     * @return HasMany<OutboxMessage, $this>
+     */
+    public function outboxMessages(): HasMany
+    {
+        /** @var HasMany<OutboxMessage, $this> $relation */
+        $relation = $this->hasMany(OutboxMessage::class, 'aggregate_id');
+        $relation->where('aggregate_type', self::class);
+
+        return $relation;
+    }
+
     public function canBeSent(): bool
     {
         $canBeSent = ! in_array($this->status, [
