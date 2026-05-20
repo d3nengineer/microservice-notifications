@@ -6,12 +6,14 @@ namespace Tests\Unit;
 
 use App\Actions\ProcessNotificationDeliveryMessage;
 use App\DTO\KafkaNotificationMessage;
+use App\Enums\DeliveryAttemptStatus;
 use App\Enums\NotificationChannel;
 use App\Enums\NotificationDeliveryProcessingStatus;
 use App\Enums\NotificationPriority;
 use App\Enums\NotificationStatus;
 use App\Models\DeliveryAttempt;
 use App\Models\Notification;
+use App\Services\Notifications\Gateways\FakeGateway;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
@@ -20,8 +22,10 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
 {
     use RefreshDatabase;
 
-    public function test_it_accepts_queued_notifications_for_gateway_handoff(): void
+    public function test_it_sends_queued_notifications_through_the_gateway(): void
     {
+        $gateway = $this->useFakeGateway();
+
         /** @var Notification $notification */
         $notification = Notification::factory()->queued()->create();
 
@@ -34,11 +38,98 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
         $this->assertTrue($result->isConsumed());
         $this->assertSame(NotificationDeliveryProcessingStatus::Consumed, $result->status);
         $this->assertSame($notification->id, $result->notificationId);
-        $this->assertDatabaseCount((new DeliveryAttempt)->getTable(), 0);
+        $this->assertSame(1, $gateway->sendCount($notification->id));
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::Succeeded->value,
+            'attempt_number' => 1,
+            'error_code' => null,
+            'error_message' => null,
+        ]);
+        $this->assertSame(NotificationStatus::Sent, $notification->refresh()->status);
+    }
+
+    public function test_it_records_temporary_gateway_failures_without_marking_notification_final(): void
+    {
+        $gateway = $this->useFakeGateway();
+        $gateway->temporarilyFail(errorCode: 'timeout', errorMessage: 'Gateway timed out.');
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->queued()->create();
+
+        $result = app(ProcessNotificationDeliveryMessage::class)(new KafkaNotificationMessage(
+            topic: 'notifications.normal',
+            payload: $this->validPayload($notification, attempt: 2),
+        ));
+
+        $this->assertTrue($result->isConsumed());
+        $this->assertSame(1, $gateway->sendCount($notification->id));
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::TemporaryFailed->value,
+            'attempt_number' => 2,
+            'error_code' => 'timeout',
+            'error_message' => 'Gateway timed out.',
+        ]);
+        $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
+    }
+
+    public function test_it_records_permanent_gateway_failures_and_drops_notification(): void
+    {
+        $gateway = $this->useFakeGateway();
+        $gateway->permanentlyFail(errorCode: 'invalid_recipient', errorMessage: 'Recipient is invalid.');
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->queued()->create();
+
+        $result = app(ProcessNotificationDeliveryMessage::class)(new KafkaNotificationMessage(
+            topic: 'notifications.normal',
+            payload: $this->validPayload($notification),
+        ));
+
+        $this->assertTrue($result->isConsumed());
+        $this->assertSame(1, $gateway->sendCount($notification->id));
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::PermanentlyFailed->value,
+            'attempt_number' => 1,
+            'error_code' => 'invalid_recipient',
+            'error_message' => 'Recipient is invalid.',
+        ]);
+        $this->assertSame(NotificationStatus::Dropped, $notification->refresh()->status);
+    }
+
+    public function test_it_skips_duplicate_same_attempt_redelivery_without_calling_gateway_again(): void
+    {
+        $gateway = $this->useFakeGateway();
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->queued()->create();
+        DeliveryAttempt::factory()->succeeded()->create([
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'attempt_number' => 4,
+        ]);
+
+        $result = app(ProcessNotificationDeliveryMessage::class)(new KafkaNotificationMessage(
+            topic: 'notifications.normal',
+            payload: $this->validPayload($notification, attempt: 4),
+        ));
+
+        $this->assertTrue($result->isConsumed());
+        $this->assertSame('duplicate_attempt', $result->reason);
+        $this->assertSame(0, $gateway->sendCount($notification->id));
+        $this->assertDatabaseCount((new DeliveryAttempt)->getTable(), 1);
+        $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
     }
 
     public function test_it_skips_notifications_in_final_statuses(): void
     {
+        $gateway = $this->useFakeGateway();
+
         /** @var Notification $notification */
         $notification = Notification::factory()->delivered()->create();
 
@@ -50,6 +141,8 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
         $this->assertTrue($result->isSkipped());
         $this->assertSame($notification->id, $result->notificationId);
         $this->assertSame('final_status', $result->reason);
+        $this->assertSame(0, $gateway->sendCount($notification->id));
+        $this->assertDatabaseCount((new DeliveryAttempt)->getTable(), 0);
     }
 
     public function test_it_reports_missing_notifications(): void
@@ -111,6 +204,8 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
 
     public function test_it_skips_dropped_notifications_without_delivery_attempts(): void
     {
+        $gateway = $this->useFakeGateway();
+
         /** @var Notification $notification */
         $notification = Notification::factory()->create([
             'status' => NotificationStatus::Dropped,
@@ -122,6 +217,7 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
         ));
 
         $this->assertTrue($result->isSkipped());
+        $this->assertSame(0, $gateway->sendCount($notification->id));
         $this->assertDatabaseCount((new DeliveryAttempt)->getTable(), 0);
     }
 
@@ -166,5 +262,16 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
             'priority' => $notification->priority->value,
             'attempt' => $attempt,
         ];
+    }
+
+    private function useFakeGateway(): FakeGateway
+    {
+        config()->set('notifications.gateways.channels.email', 'fake');
+        config()->set('notifications.gateways.channels.sms', 'fake');
+
+        $gateway = new FakeGateway;
+        $this->app->instance(FakeGateway::class, $gateway);
+
+        return $gateway;
     }
 }
