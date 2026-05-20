@@ -4,15 +4,17 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
-use PHPUnit\Framework\TestCase;
+use Tests\TestCase;
 
 class ExampleTest extends TestCase
 {
-    /**
-     * A basic test example.
-     */
-    public function test_that_true_is_true(): void
+    public function test_local_user_authentication_is_not_configured(): void
     {
-        $this->assertNotSame('', PHP_VERSION);
+        $this->assertNull(config('auth.defaults.guard'));
+        $this->assertNull(config('auth.defaults.passwords'));
+        $this->assertNull(config('auth.guards.web.provider'));
+        $this->assertNull(config('auth.providers.users.model'));
+        $this->assertNull(config('auth.passwords.users.provider'));
+        $this->assertNull(config('auth.passwords.users.table'));
     }
 }
