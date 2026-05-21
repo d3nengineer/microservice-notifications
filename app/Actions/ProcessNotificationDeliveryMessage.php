@@ -109,6 +109,16 @@ class ProcessNotificationDeliveryMessage
         $rateLimit = $this->gatewayRateLimiter->attempt($notification, $gatewayName);
 
         if (! $rateLimit->allowed) {
+            Log::warning('Notification gateway send skipped because rate limit was reached.', [
+                'notification_id' => $notification->id,
+                'attempt' => $attemptNumber,
+                'gateway' => $gatewayName,
+                'channel' => $notification->channel->value,
+                'max_attempts' => $rateLimit->maxAttempts,
+                'decay_seconds' => $rateLimit->decaySeconds,
+                'retry_after_seconds' => $rateLimit->retryAfterSeconds,
+            ]);
+
             $gatewayResult = GatewayResult::temporaryFailure(
                 gatewayName: $gatewayName,
                 errorCode: 'gateway_rate_limited',
