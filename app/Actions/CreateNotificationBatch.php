@@ -15,13 +15,13 @@ use App\Models\IdempotencyKey;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
 use App\Models\OutboxMessage;
+use App\Services\Notifications\NotificationBatchIdempotencyLock;
 use App\Services\Notifications\NotificationBatchPayloadHasher;
 use App\Services\Notifications\NotificationKafkaPayloadBuilder;
 use App\Services\Notifications\NotificationKafkaTopicResolver;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use LogicException;
@@ -31,6 +31,7 @@ class CreateNotificationBatch
 {
     public function __construct(
         private readonly NotificationBatchPayloadHasher $payloadHasher,
+        private readonly NotificationBatchIdempotencyLock $idempotencyLock,
         private readonly NotificationKafkaTopicResolver $topicResolver,
         private readonly NotificationKafkaPayloadBuilder $kafkaPayloadBuilder,
     ) {}
@@ -47,10 +48,12 @@ class CreateNotificationBatch
             'recipient_count' => count($data->recipientIds),
         ]);
 
-        $lock = Cache::lock($this->lockName($data->idempotencyKey), 10);
-
         try {
-            $result = $lock->block(3, fn (): NotificationBatchCreationResult => $this->createOrReplay($data, $payloadHash, $request));
+            $result = $this->idempotencyLock->block(
+                $data->idempotencyKey,
+                $payloadHash,
+                fn (): NotificationBatchCreationResult => $this->createOrReplay($data, $payloadHash, $request),
+            );
         } catch (LockTimeoutException) {
             Log::warning('Idempotency lock acquisition timed out.', [
                 'idempotency_key' => $data->idempotencyKey,
@@ -70,10 +73,6 @@ class CreateNotificationBatch
             ]);
 
             throw $exception;
-        }
-
-        if (! $result instanceof NotificationBatchCreationResult) {
-            throw new LogicException('Idempotent notification batch creation returned an unexpected result.');
         }
 
         return $result;
@@ -178,11 +177,6 @@ class CreateNotificationBatch
         }
 
         return $result;
-    }
-
-    private function lockName(string $idempotencyKey): string
-    {
-        return 'notification-batches:idempotency:'.hash('sha256', $idempotencyKey);
     }
 
     /**

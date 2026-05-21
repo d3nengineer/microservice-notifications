@@ -12,6 +12,9 @@ use App\Models\IdempotencyKey;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
 use App\Models\OutboxMessage;
+use App\Services\Notifications\NotificationBatchIdempotencyLock;
+use Illuminate\Cache\Repository;
+use Illuminate\Contracts\Cache\Lock;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -147,8 +150,12 @@ class NotificationApiTest extends TestCase
     public function test_batch_creation_returns_locked_response_when_idempotency_lock_is_busy(): void
     {
         $idempotencyKey = 'request-locked-001';
-        $lock = Cache::lock('notification-batches:idempotency:'.hash('sha256', $idempotencyKey), 10);
-
+        $idempotencyLock = app(NotificationBatchIdempotencyLock::class);
+        /** @var Repository $repository */
+        $repository = Cache::store('array');
+        /** @phpstan-ignore-next-line Laravel cache repositories support atomic locks at runtime. */
+        $lock = $repository->lock($idempotencyLock->lockName($idempotencyKey), 10);
+        /** @var Lock $lock */
         $this->assertTrue($lock->get());
 
         try {
