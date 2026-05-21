@@ -375,6 +375,113 @@ class NotificationIntegrationFlowTest extends TestCase
             ->count());
     }
 
+    public function test_subscriber_history_reflects_current_statuses_and_invalidates_cached_responses(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-05-21 11:00:00'));
+        config()->set('notifications.cache.history.enabled', true);
+        config()->set('notifications.cache.history.store', 'array');
+        config()->set('notifications.delivery.max_attempts', 3);
+        config()->set('notifications.delivery.backoff_seconds', 1);
+        config()->set('notifications.delivery.max_backoff_seconds', 10);
+
+        $messaging = $this->useFakeMessaging();
+        $gateway = $this->useFakeGateway();
+        $recipientId = 'subscriber-history';
+
+        $successfulNotification = $this->createPublishedNotificationUsing(
+            producer: $messaging->producer,
+            idempotencyKey: 'integration-history-success-001',
+            recipientId: $recipientId,
+        );
+        Notification::factory()->create([
+            'recipient_id' => 'subscriber-history-other',
+            'status' => NotificationStatus::Sent,
+        ]);
+
+        $cachedQueuedHistoryResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => $recipientId,
+        ]));
+
+        $cachedQueuedHistoryResponse
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $successfulNotification->id)
+            ->assertJsonPath('data.0.status', NotificationStatus::Queued->value);
+
+        $this->pushPublishedMessage($messaging->consumer, $this->lastPublishedMessage($messaging->producer));
+        $this->consumeOneNotification();
+
+        $freshSentHistoryResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => $recipientId,
+        ]));
+
+        $freshSentHistoryResponse
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $successfulNotification->id)
+            ->assertJsonPath('data.0.status', NotificationStatus::Sent->value);
+
+        $retrySuccessNotification = $this->createPublishedNotificationUsing(
+            producer: $messaging->producer,
+            idempotencyKey: 'integration-history-retry-success-001',
+            recipientId: $recipientId,
+        );
+        $gateway->forNotification(
+            $retrySuccessNotification->id,
+            GatewayResult::temporaryFailure('fake', 'timeout', 'Gateway timed out.'),
+        );
+        $this->pushPublishedMessage($messaging->consumer, $this->lastPublishedMessage($messaging->producer));
+        $this->consumeOneNotification();
+        $gateway->forNotification($retrySuccessNotification->id, GatewayResult::success('fake'));
+        Carbon::setTestNow(Carbon::parse('2026-05-21 11:00:02'));
+        $this->publishOneOutboxMessage();
+        $this->pushPublishedMessage($messaging->consumer, $this->lastPublishedMessage($messaging->producer));
+        $this->consumeOneNotification();
+
+        $droppedNotification = $this->createPublishedNotificationUsing(
+            producer: $messaging->producer,
+            idempotencyKey: 'integration-history-dropped-001',
+            recipientId: $recipientId,
+        );
+        $gateway->forNotification(
+            $droppedNotification->id,
+            GatewayResult::permanentFailure('fake', 'invalid_recipient', 'Recipient is invalid.'),
+        );
+        $this->pushPublishedMessage($messaging->consumer, $this->lastPublishedMessage($messaging->producer));
+        $this->consumeOneNotification();
+
+        $queuedRetryNotification = $this->createPublishedNotificationUsing(
+            producer: $messaging->producer,
+            idempotencyKey: 'integration-history-queued-retry-001',
+            recipientId: $recipientId,
+        );
+        $gateway->forNotification(
+            $queuedRetryNotification->id,
+            GatewayResult::temporaryFailure('fake', 'timeout', 'Gateway timed out.'),
+        );
+        $this->pushPublishedMessage($messaging->consumer, $this->lastPublishedMessage($messaging->producer));
+        $this->consumeOneNotification();
+
+        $historyResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => $recipientId,
+        ]));
+
+        $historyResponse
+            ->assertOk()
+            ->assertJsonCount(4, 'data')
+            ->assertJsonPath('meta.total', 4);
+
+        $statusesByNotificationId = collect($historyResponse->json('data'))
+            ->mapWithKeys(fn (array $notification): array => [$notification['id'] => $notification['status']])
+            ->all();
+
+        $this->assertSame(NotificationStatus::Sent->value, $statusesByNotificationId[$successfulNotification->id]);
+        $this->assertSame(NotificationStatus::Sent->value, $statusesByNotificationId[$retrySuccessNotification->id]);
+        $this->assertSame(NotificationStatus::Dropped->value, $statusesByNotificationId[$droppedNotification->id]);
+        $this->assertSame(NotificationStatus::Queued->value, $statusesByNotificationId[$queuedRetryNotification->id]);
+        $this->assertNotContains('subscriber-history-other', collect($historyResponse->json('data'))->pluck('recipient_id')->all());
+    }
+
     /**
      * @return object{
      *     producer: FakeKafkaProducer,
@@ -388,6 +495,25 @@ class NotificationIntegrationFlowTest extends TestCase
         $messaging = $this->useFakeMessaging();
         $gateway = $this->useFakeGateway();
 
+        $notification = $this->createPublishedNotificationUsing(
+            producer: $messaging->producer,
+            idempotencyKey: $idempotencyKey,
+            recipientId: $recipientId,
+        );
+
+        return (object) [
+            'producer' => $messaging->producer,
+            'consumer' => $messaging->consumer,
+            'gateway' => $gateway,
+            'notification' => $notification,
+        ];
+    }
+
+    private function createPublishedNotificationUsing(
+        FakeKafkaProducer $producer,
+        string $idempotencyKey,
+        string $recipientId,
+    ): Notification {
         $response = $this->postJson(route('api.v1.notification-batches.store'), [
             'channel' => NotificationChannel::Email->value,
             'message' => 'Your verification code is 1234',
@@ -406,17 +532,17 @@ class NotificationIntegrationFlowTest extends TestCase
             ->assertSuccessful()
             ->run();
 
+        $batchId = $response->json('data.batch_id');
+
         /** @var Notification $notification */
         $notification = Notification::query()
+            ->where('batch_id', $batchId)
             ->where('recipient_id', $recipientId)
             ->sole();
 
-        return (object) [
-            'producer' => $messaging->producer,
-            'consumer' => $messaging->consumer,
-            'gateway' => $gateway,
-            'notification' => $notification,
-        ];
+        $this->assertSame($notification->id, $this->lastPublishedMessage($producer)['payload']['notification_id']);
+
+        return $notification;
     }
 
     /**
@@ -429,6 +555,37 @@ class NotificationIntegrationFlowTest extends TestCase
             payload: $publishedMessage['payload'],
             key: $publishedMessage['key'],
         ));
+    }
+
+    private function consumeOneNotification(): void
+    {
+        $command = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+    }
+
+    private function publishOneOutboxMessage(): void
+    {
+        $command = $this->artisan('outbox:publish', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Processed 1 outbox messages: 1 published, 0 retried, 0 failed.')
+            ->assertSuccessful()
+            ->run();
+    }
+
+    /**
+     * @return array{topic: string, payload: array<string, mixed>, key: string|null}
+     */
+    private function lastPublishedMessage(FakeKafkaProducer $producer): array
+    {
+        $publishedMessages = $producer->publishedMessages();
+        $this->assertNotEmpty($publishedMessages);
+
+        return $publishedMessages[array_key_last($publishedMessages)];
     }
 
     /**
