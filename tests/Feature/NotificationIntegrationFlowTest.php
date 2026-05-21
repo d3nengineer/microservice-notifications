@@ -6,10 +6,14 @@ namespace Tests\Feature;
 
 use App\Contracts\KafkaConsumer;
 use App\Contracts\KafkaProducer;
+use App\DTO\GatewayResult;
+use App\DTO\KafkaNotificationMessage;
+use App\Enums\DeliveryAttemptStatus;
 use App\Enums\NotificationChannel;
 use App\Enums\NotificationPriority;
 use App\Enums\NotificationStatus;
 use App\Enums\OutboxMessageStatus;
+use App\Models\DeliveryAttempt;
 use App\Models\IdempotencyKey;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
@@ -18,12 +22,20 @@ use App\Services\Kafka\FakeKafkaConsumer;
 use App\Services\Kafka\FakeKafkaProducer;
 use App\Services\Notifications\Gateways\FakeGateway;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Carbon;
 use Illuminate\Testing\PendingCommand;
 use Tests\TestCase;
 
 class NotificationIntegrationFlowTest extends TestCase
 {
     use RefreshDatabase;
+
+    protected function tearDown(): void
+    {
+        Carbon::setTestNow();
+
+        parent::tearDown();
+    }
 
     public function test_mass_notification_intake_stages_and_publishes_outbox_messages(): void
     {
@@ -148,6 +160,277 @@ class NotificationIntegrationFlowTest extends TestCase
         $this->assertCount(2, $producer->publishedMessages());
     }
 
+    public function test_published_notification_is_consumed_successfully_and_visible_in_subscriber_history(): void
+    {
+        $fixtures = $this->createPublishedNotification(
+            idempotencyKey: 'integration-consumer-success-001',
+            recipientId: 'subscriber-success',
+        );
+
+        $this->pushPublishedMessage($fixtures->consumer, $fixtures->producer->publishedMessages()[0]);
+
+        $command = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+
+        $this->assertSame(1, $fixtures->gateway->sendCount($fixtures->notification->id));
+        $this->assertSame(NotificationStatus::Sent, $fixtures->notification->refresh()->status);
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $fixtures->notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::Succeeded->value,
+            'attempt_number' => 1,
+            'error_code' => null,
+            'error_message' => null,
+        ]);
+
+        $historyResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => 'subscriber-success',
+        ]));
+
+        $historyResponse
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $fixtures->notification->id)
+            ->assertJsonPath('data.0.status', NotificationStatus::Sent->value);
+    }
+
+    public function test_temporary_gateway_failure_stages_retry_and_retry_can_succeed(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-05-21 10:00:00'));
+        config()->set('notifications.delivery.max_attempts', 3);
+        config()->set('notifications.delivery.backoff_seconds', 1);
+        config()->set('notifications.delivery.max_backoff_seconds', 10);
+
+        $fixtures = $this->createPublishedNotification(
+            idempotencyKey: 'integration-consumer-retry-001',
+            recipientId: 'subscriber-retry',
+        );
+
+        $fixtures->gateway->forNotification(
+            $fixtures->notification->id,
+            GatewayResult::temporaryFailure('fake', 'timeout', 'Gateway timed out.'),
+        );
+
+        $this->pushPublishedMessage($fixtures->consumer, $fixtures->producer->publishedMessages()[0]);
+
+        $firstConsumeCommand = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $firstConsumeCommand);
+
+        $firstConsumeCommand->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+
+        $this->assertSame(1, $fixtures->gateway->sendCount($fixtures->notification->id));
+        $this->assertSame(NotificationStatus::Queued, $fixtures->notification->refresh()->status);
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $fixtures->notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::TemporaryFailed->value,
+            'attempt_number' => 1,
+            'error_code' => 'timeout',
+            'error_message' => 'Gateway timed out.',
+        ]);
+
+        /** @var OutboxMessage $retryOutboxMessage */
+        $retryOutboxMessage = OutboxMessage::query()
+            ->where('aggregate_id', $fixtures->notification->id)
+            ->where('status', OutboxMessageStatus::Pending)
+            ->sole();
+
+        $this->assertSame(2, $retryOutboxMessage->payload['attempt']);
+        $this->assertTrue($retryOutboxMessage->available_at->equalTo(Carbon::parse('2026-05-21 10:00:01')));
+
+        $queuedHistoryResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => 'subscriber-retry',
+        ]));
+
+        $queuedHistoryResponse
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $fixtures->notification->id)
+            ->assertJsonPath('data.0.status', NotificationStatus::Queued->value);
+
+        $fixtures->gateway->forNotification(
+            $fixtures->notification->id,
+            GatewayResult::success('fake'),
+        );
+        Carbon::setTestNow(Carbon::parse('2026-05-21 10:00:02'));
+
+        $publishRetryCommand = $this->artisan('outbox:publish', ['--limit' => 10, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $publishRetryCommand);
+
+        $publishRetryCommand->expectsOutputToContain('Processed 1 outbox messages: 1 published, 0 retried, 0 failed.')
+            ->assertSuccessful()
+            ->run();
+
+        $publishedMessages = $fixtures->producer->publishedMessages();
+        $this->assertCount(2, $publishedMessages);
+        $this->pushPublishedMessage($fixtures->consumer, $publishedMessages[1]);
+
+        $secondConsumeCommand = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $secondConsumeCommand);
+
+        $secondConsumeCommand->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+
+        $this->assertSame(2, $fixtures->gateway->sendCount($fixtures->notification->id));
+        $this->assertSame(NotificationStatus::Sent, $fixtures->notification->refresh()->status);
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $fixtures->notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::Succeeded->value,
+            'attempt_number' => 2,
+            'error_code' => null,
+            'error_message' => null,
+        ]);
+        $this->assertSame(0, OutboxMessage::query()
+            ->where('aggregate_id', $fixtures->notification->id)
+            ->where('status', OutboxMessageStatus::Pending)
+            ->count());
+
+        $sentHistoryResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => 'subscriber-retry',
+        ]));
+
+        $sentHistoryResponse
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $fixtures->notification->id)
+            ->assertJsonPath('data.0.status', NotificationStatus::Sent->value);
+    }
+
+    public function test_permanent_gateway_failure_drops_notification_without_retry(): void
+    {
+        $fixtures = $this->createPublishedNotification(
+            idempotencyKey: 'integration-consumer-permanent-failure-001',
+            recipientId: 'subscriber-permanent-failure',
+        );
+
+        $fixtures->gateway->permanentlyFail(errorCode: 'invalid_recipient', errorMessage: 'Recipient is invalid.');
+        $this->pushPublishedMessage($fixtures->consumer, $fixtures->producer->publishedMessages()[0]);
+
+        $command = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+
+        $this->assertSame(1, $fixtures->gateway->sendCount($fixtures->notification->id));
+        $this->assertSame(NotificationStatus::Dropped, $fixtures->notification->refresh()->status);
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $fixtures->notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::PermanentlyFailed->value,
+            'attempt_number' => 1,
+            'error_code' => 'invalid_recipient',
+            'error_message' => 'Recipient is invalid.',
+        ]);
+        $this->assertSame(0, OutboxMessage::query()
+            ->where('aggregate_id', $fixtures->notification->id)
+            ->where('status', OutboxMessageStatus::Pending)
+            ->count());
+    }
+
+    public function test_exhausted_temporary_gateway_failure_drops_notification_without_retry(): void
+    {
+        config()->set('notifications.delivery.max_attempts', 3);
+
+        $fixtures = $this->createPublishedNotification(
+            idempotencyKey: 'integration-consumer-exhausted-failure-001',
+            recipientId: 'subscriber-exhausted-failure',
+        );
+
+        $fixtures->gateway->temporarilyFail(errorCode: 'timeout', errorMessage: 'Gateway timed out.');
+
+        $publishedMessage = $fixtures->producer->publishedMessages()[0];
+        $publishedMessage['payload']['attempt'] = 3;
+        $this->pushPublishedMessage($fixtures->consumer, $publishedMessage);
+
+        $command = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+
+        $this->assertSame(1, $fixtures->gateway->sendCount($fixtures->notification->id));
+        $this->assertSame(NotificationStatus::Dropped, $fixtures->notification->refresh()->status);
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $fixtures->notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::TemporaryFailed->value,
+            'attempt_number' => 3,
+            'error_code' => 'timeout',
+            'error_message' => 'Gateway timed out.',
+        ]);
+        $this->assertSame(0, OutboxMessage::query()
+            ->where('aggregate_id', $fixtures->notification->id)
+            ->where('status', OutboxMessageStatus::Pending)
+            ->count());
+    }
+
+    /**
+     * @return object{
+     *     producer: FakeKafkaProducer,
+     *     consumer: FakeKafkaConsumer,
+     *     gateway: FakeGateway,
+     *     notification: Notification
+     * }
+     */
+    private function createPublishedNotification(string $idempotencyKey, string $recipientId): object
+    {
+        $messaging = $this->useFakeMessaging();
+        $gateway = $this->useFakeGateway();
+
+        $response = $this->postJson(route('api.v1.notification-batches.store'), [
+            'channel' => NotificationChannel::Email->value,
+            'message' => 'Your verification code is 1234',
+            'recipient_ids' => [$recipientId],
+            'priority' => NotificationPriority::High->value,
+        ], [
+            'Idempotency-Key' => $idempotencyKey,
+        ]);
+
+        $response->assertCreated();
+
+        $command = $this->artisan('outbox:publish', ['--limit' => 10, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Processed 1 outbox messages: 1 published, 0 retried, 0 failed.')
+            ->assertSuccessful()
+            ->run();
+
+        /** @var Notification $notification */
+        $notification = Notification::query()
+            ->where('recipient_id', $recipientId)
+            ->sole();
+
+        return (object) [
+            'producer' => $messaging->producer,
+            'consumer' => $messaging->consumer,
+            'gateway' => $gateway,
+            'notification' => $notification,
+        ];
+    }
+
+    /**
+     * @param  array{topic: string, payload: array<string, mixed>, key: string|null}  $publishedMessage
+     */
+    private function pushPublishedMessage(FakeKafkaConsumer $consumer, array $publishedMessage): void
+    {
+        $consumer->push(new KafkaNotificationMessage(
+            topic: $publishedMessage['topic'],
+            payload: $publishedMessage['payload'],
+            key: $publishedMessage['key'],
+        ));
+    }
+
     /**
      * @return object{producer: FakeKafkaProducer, consumer: FakeKafkaConsumer}
      */
@@ -169,6 +452,7 @@ class NotificationIntegrationFlowTest extends TestCase
     {
         config()->set('notifications.gateways.channels.email', 'fake');
         config()->set('notifications.gateways.channels.sms', 'fake');
+        config()->set('notifications.cache.rate_limits.store', 'array');
 
         $gateway = new FakeGateway;
         $this->app->instance(FakeGateway::class, $gateway);
