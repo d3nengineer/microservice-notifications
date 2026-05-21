@@ -21,6 +21,7 @@ use App\Models\OutboxMessage;
 use App\Services\Kafka\FakeKafkaConsumer;
 use App\Services\Kafka\FakeKafkaProducer;
 use App\Services\Notifications\Gateways\FakeGateway;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Testing\PendingCommand;
@@ -69,11 +70,13 @@ class NotificationIntegrationFlowTest extends TestCase
         $this->assertDatabaseCount((new Notification)->getTable(), 3);
         $this->assertDatabaseCount((new OutboxMessage)->getTable(), 3);
 
+        /** @var Collection<int, Notification> $notifications */
         $notifications = Notification::query()
             ->where('batch_id', $batchId)
             ->orderBy('recipient_id')
             ->get();
 
+        /** @var Collection<int, OutboxMessage> $outboxMessages */
         $outboxMessages = OutboxMessage::query()
             ->orderBy('aggregate_id')
             ->get();
@@ -84,13 +87,15 @@ class NotificationIntegrationFlowTest extends TestCase
         );
 
         foreach ($outboxMessages as $outboxMessage) {
+            $payload = $this->notificationPayload($outboxMessage->payload);
+
             $this->assertSame(Notification::class, $outboxMessage->aggregate_type);
             $this->assertSame('notifications.high', $outboxMessage->topic);
             $this->assertSame(OutboxMessageStatus::Pending, $outboxMessage->status);
             $this->assertSame(0, $outboxMessage->attempts);
-            $this->assertSame(1, $outboxMessage->payload['attempt']);
-            $this->assertSame(NotificationChannel::Email->value, $outboxMessage->payload['channel']);
-            $this->assertSame(NotificationPriority::High->value, $outboxMessage->payload['priority']);
+            $this->assertSame(1, $payload['attempt']);
+            $this->assertSame(NotificationChannel::Email->value, $payload['channel']);
+            $this->assertSame(NotificationPriority::High->value, $payload['priority']);
         }
 
         $command = $this->artisan('outbox:publish', ['--limit' => 10, '--once' => true]);
@@ -107,12 +112,14 @@ class NotificationIntegrationFlowTest extends TestCase
         $this->assertCount(3, $producer->publishedMessages());
 
         foreach ($producer->publishedMessages() as $publishedMessage) {
+            $payload = $this->notificationPayload($publishedMessage['payload']);
+
             $this->assertSame('notifications.high', $publishedMessage['topic']);
-            $this->assertSame(1, $publishedMessage['payload']['attempt']);
-            $this->assertSame(NotificationChannel::Email->value, $publishedMessage['payload']['channel']);
-            $this->assertSame(NotificationPriority::High->value, $publishedMessage['payload']['priority']);
-            $this->assertContains($publishedMessage['payload']['notification_id'], $notifications->pluck('id')->all());
-            $this->assertSame(Notification::class.':'.$publishedMessage['payload']['notification_id'], $publishedMessage['key']);
+            $this->assertSame(1, $payload['attempt']);
+            $this->assertSame(NotificationChannel::Email->value, $payload['channel']);
+            $this->assertSame(NotificationPriority::High->value, $payload['priority']);
+            $this->assertContains($payload['notification_id'], $notifications->pluck('id')->all());
+            $this->assertSame(Notification::class.':'.$payload['notification_id'], $publishedMessage['key']);
         }
 
         $this->assertSame(0, $notifications->sum(fn (Notification $notification): int => $gateway->sendCount($notification->id)));
@@ -471,7 +478,9 @@ class NotificationIntegrationFlowTest extends TestCase
             ->assertJsonCount(4, 'data')
             ->assertJsonPath('meta.total', 4);
 
-        $statusesByNotificationId = collect($historyResponse->json('data'))
+        $historyNotifications = $this->historyNotifications($historyResponse->json('data'));
+
+        $statusesByNotificationId = collect($historyNotifications)
             ->mapWithKeys(fn (array $notification): array => [$notification['id'] => $notification['status']])
             ->all();
 
@@ -479,7 +488,7 @@ class NotificationIntegrationFlowTest extends TestCase
         $this->assertSame(NotificationStatus::Sent->value, $statusesByNotificationId[$retrySuccessNotification->id]);
         $this->assertSame(NotificationStatus::Dropped->value, $statusesByNotificationId[$droppedNotification->id]);
         $this->assertSame(NotificationStatus::Queued->value, $statusesByNotificationId[$queuedRetryNotification->id]);
-        $this->assertNotContains('subscriber-history-other', collect($historyResponse->json('data'))->pluck('recipient_id')->all());
+        $this->assertNotContains('subscriber-history-other', collect($historyNotifications)->pluck('recipient_id')->all());
     }
 
     /**
@@ -540,7 +549,7 @@ class NotificationIntegrationFlowTest extends TestCase
             ->where('recipient_id', $recipientId)
             ->sole();
 
-        $this->assertSame($notification->id, $this->lastPublishedMessage($producer)['payload']['notification_id']);
+        $this->assertSame($notification->id, $this->notificationPayload($this->lastPublishedMessage($producer)['payload'])['notification_id']);
 
         return $notification;
     }
@@ -585,7 +594,61 @@ class NotificationIntegrationFlowTest extends TestCase
         $publishedMessages = $producer->publishedMessages();
         $this->assertNotEmpty($publishedMessages);
 
-        return $publishedMessages[array_key_last($publishedMessages)];
+        $lastPublishedMessageKey = array_key_last($publishedMessages);
+        $this->assertIsInt($lastPublishedMessageKey);
+
+        return $publishedMessages[$lastPublishedMessageKey];
+    }
+
+    /**
+     * @return array{notification_id: int, channel: string, priority: string, attempt: int}
+     */
+    private function notificationPayload(mixed $payload): array
+    {
+        $this->assertIsArray($payload);
+
+        $notificationId = $payload['notification_id'] ?? null;
+        $channel = $payload['channel'] ?? null;
+        $priority = $payload['priority'] ?? null;
+        $attempt = $payload['attempt'] ?? null;
+
+        $this->assertIsInt($notificationId);
+        $this->assertIsString($channel);
+        $this->assertIsString($priority);
+        $this->assertIsInt($attempt);
+
+        return [
+            'notification_id' => $notificationId,
+            'channel' => $channel,
+            'priority' => $priority,
+            'attempt' => $attempt,
+        ];
+    }
+
+    /**
+     * @return array<int, array{id: int, recipient_id: string, status: string}>
+     */
+    private function historyNotifications(mixed $notifications): array
+    {
+        $this->assertIsArray($notifications);
+
+        return array_values(array_map(function (mixed $notification): array {
+            $this->assertIsArray($notification);
+
+            $id = $notification['id'] ?? null;
+            $recipientId = $notification['recipient_id'] ?? null;
+            $status = $notification['status'] ?? null;
+
+            $this->assertIsInt($id);
+            $this->assertIsString($recipientId);
+            $this->assertIsString($status);
+
+            return [
+                'id' => $id,
+                'recipient_id' => $recipientId,
+                'status' => $status,
+            ];
+        }, $notifications));
     }
 
     /**
