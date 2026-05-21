@@ -23,6 +23,9 @@ use App\Services\Notifications\StageNotificationRetryOutboxMessage;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
+use Mockery;
+use Mockery\MockInterface;
+use Mockery\VerificationDirector;
 use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 use Tests\TestCase;
@@ -289,26 +292,9 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
         ]);
 
         app(NotificationGatewayRateLimiter::class)->attempt($notification, 'FakeGateway');
-        $warningMessages = [];
-        Log::swap(new class($warningMessages)
-        {
-            /**
-             * @param  array<int, string>  $warningMessages
-             */
-            public function __construct(
-                private array &$warningMessages,
-            ) {}
-
-            /**
-             * @param  array<string, mixed>  $context
-             */
-            public function warning(string $message, array $context = []): void
-            {
-                $this->warningMessages[] = $message;
-            }
-
-            public function __call(string $name, array $arguments): void {}
-        });
+        /** @var MockInterface $logger */
+        $logger = Mockery::spy();
+        Log::swap($logger);
 
         $result = app(ProcessNotificationDeliveryMessage::class)(new KafkaNotificationMessage(
             topic: 'notifications.normal',
@@ -331,14 +317,19 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
             'status' => OutboxMessageStatus::Pending->value,
         ]);
         $this->assertSame(2, OutboxMessage::query()->sole()->payload['attempt']);
-        $this->assertSame(1, count(array_filter(
-            $warningMessages,
-            fn (string $message): bool => $message === 'Notification gateway rate limit reached.',
-        )));
-        $this->assertContains(
+        /** @var VerificationDirector $rateLimitWarning */
+        $rateLimitWarning = $logger->shouldHaveReceived('warning', [
+            'Notification gateway rate limit reached.',
+            Mockery::type('array'),
+        ]);
+        $rateLimitWarning->once();
+
+        /** @var VerificationDirector $processorWarning */
+        $processorWarning = $logger->shouldHaveReceived('warning', [
             'Notification gateway send skipped because rate limit was reached.',
-            $warningMessages,
-        );
+            Mockery::type('array'),
+        ]);
+        $processorWarning->once();
     }
 
     public function test_it_skips_notifications_in_final_statuses(): void

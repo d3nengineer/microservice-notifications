@@ -6,6 +6,8 @@ namespace Tests\Unit;
 
 use App\Services\Notifications\NotificationDeliveryRetryPolicy;
 use Illuminate\Support\Facades\Log;
+use Mockery;
+use Mockery\MockInterface;
 use Tests\TestCase;
 
 class NotificationDeliveryRetryPolicyTest extends TestCase
@@ -67,7 +69,9 @@ class NotificationDeliveryRetryPolicyTest extends TestCase
     public function test_retry_decisions_do_not_emit_duplicate_operational_logs(): void
     {
         config()->set('notifications.delivery.max_attempts', 3);
-        Log::spy();
+        /** @var MockInterface $logger */
+        $logger = Mockery::spy();
+        Log::swap($logger);
 
         $policy = new NotificationDeliveryRetryPolicy;
 
@@ -75,6 +79,6 @@ class NotificationDeliveryRetryPolicyTest extends TestCase
         $this->assertFalse($policy->isExhausted(1));
         $this->assertFalse($policy->shouldRetry(3));
         $this->assertTrue($policy->isExhausted(3));
-        Log::shouldNotHaveReceived('info');
+        $logger->shouldNotHaveReceived('info');
     }
 }
