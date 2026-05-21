@@ -6,12 +6,17 @@ namespace App\Actions;
 
 use App\DTO\ListSubscriberNotificationsDTO;
 use App\Models\Notification;
+use App\Services\Notifications\SubscriberNotificationHistoryCache;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Log;
 
 class ListSubscriberNotifications
 {
+    public function __construct(
+        private readonly SubscriberNotificationHistoryCache $historyCache,
+    ) {}
+
     /**
      * @return LengthAwarePaginator<int, Notification>
      */
@@ -27,6 +32,14 @@ class ListSubscriberNotifications
             'per_page' => $filters->perPage,
         ]);
 
+        return $this->historyCache->remember($filters, fn (): LengthAwarePaginator => $this->query($filters));
+    }
+
+    /**
+     * @return LengthAwarePaginator<int, Notification>
+     */
+    private function query(ListSubscriberNotificationsDTO $filters): LengthAwarePaginator
+    {
         return Notification::query()
             ->with('batch:id')
             ->where('recipient_id', $filters->recipientId)

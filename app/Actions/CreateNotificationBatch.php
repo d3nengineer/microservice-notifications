@@ -19,6 +19,7 @@ use App\Services\Notifications\NotificationBatchIdempotencyLock;
 use App\Services\Notifications\NotificationBatchPayloadHasher;
 use App\Services\Notifications\NotificationKafkaPayloadBuilder;
 use App\Services\Notifications\NotificationKafkaTopicResolver;
+use App\Services\Notifications\SubscriberNotificationHistoryCache;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\Request;
@@ -34,6 +35,7 @@ class CreateNotificationBatch
         private readonly NotificationBatchIdempotencyLock $idempotencyLock,
         private readonly NotificationKafkaTopicResolver $topicResolver,
         private readonly NotificationKafkaPayloadBuilder $kafkaPayloadBuilder,
+        private readonly SubscriberNotificationHistoryCache $historyCache,
     ) {}
 
     public function __invoke(CreateNotificationBatchDTO $data, Request $request): NotificationBatchCreationResult
@@ -134,6 +136,10 @@ class CreateNotificationBatch
                     ])
                     ->all()
             );
+
+            foreach (array_unique($data->recipientIds) as $recipientId) {
+                $this->historyCache->invalidate($recipientId, 'notification_batch_created');
+            }
 
             $topicCounts = $this->stageOutboxMessages($batch);
 

@@ -19,6 +19,7 @@ use App\Services\Notifications\NotificationDeliveryRetryPolicy;
 use App\Services\Notifications\NotificationGatewayRateLimiter;
 use App\Services\Notifications\NotificationGatewayResolver;
 use App\Services\Notifications\StageNotificationRetryOutboxMessage;
+use App\Services\Notifications\SubscriberNotificationHistoryCache;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -32,6 +33,7 @@ class ProcessNotificationDeliveryMessage
         private readonly NotificationDeliveryRetryPolicy $retryPolicy,
         private readonly StageNotificationRetryOutboxMessage $stageRetryOutboxMessage,
         private readonly NotificationGatewayRateLimiter $gatewayRateLimiter,
+        private readonly SubscriberNotificationHistoryCache $historyCache,
     ) {}
 
     public function __invoke(KafkaNotificationMessage $message): NotificationDeliveryProcessingResult
@@ -200,6 +202,7 @@ class ProcessNotificationDeliveryMessage
                     $notification->update([
                         'status' => $gatewayResult->targetNotificationStatus,
                     ]);
+                    $this->historyCache->invalidate($notification->recipient_id, 'notification_status_changed');
 
                     Log::info('Notification status transitioned after gateway outcome.', [
                         'notification_id' => $notification->id,
@@ -262,6 +265,7 @@ class ProcessNotificationDeliveryMessage
             $notification->update([
                 'status' => NotificationStatus::Dropped,
             ]);
+            $this->historyCache->invalidate($notification->recipient_id, 'notification_status_changed');
 
             Log::warning('Notification temporary gateway failure exhausted retry attempts.', [
                 'notification_id' => $notification->id,

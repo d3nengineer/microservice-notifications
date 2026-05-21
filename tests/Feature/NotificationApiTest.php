@@ -341,4 +341,44 @@ class NotificationApiTest extends TestCase
 
         $this->assertNotSame($oldest->id, $response->json('data.0.id'));
     }
+
+    public function test_subscriber_history_cache_is_invalidated_when_batch_creates_new_notifications(): void
+    {
+        config()->set('notifications.cache.history.enabled', true);
+        config()->set('notifications.cache.history.store', 'array');
+
+        /** @var Notification $existing */
+        $existing = Notification::factory()->create([
+            'recipient_id' => 'subscriber-1',
+            'created_at' => now()->subMinute(),
+            'updated_at' => now()->subMinute(),
+        ]);
+
+        $firstResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => 'subscriber-1',
+        ]));
+
+        $firstResponse
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $existing->id);
+
+        $this->postJson(route('api.v1.notification-batches.store'), [
+            'channel' => NotificationChannel::Email->value,
+            'message' => 'Your verification code is 1234',
+            'recipient_ids' => ['subscriber-1'],
+            'priority' => NotificationPriority::Normal->value,
+        ], [
+            'Idempotency-Key' => 'request-history-cache-invalidation',
+        ])->assertCreated();
+
+        $secondResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => 'subscriber-1',
+        ]));
+
+        $secondResponse
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonPath('meta.total', 2);
+    }
 }
