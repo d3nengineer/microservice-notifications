@@ -16,6 +16,7 @@ use App\Models\DeliveryAttempt;
 use App\Models\Notification;
 use App\Services\Notifications\NotificationDeliveryMessageValidator;
 use App\Services\Notifications\NotificationDeliveryRetryPolicy;
+use App\Services\Notifications\NotificationGatewayRateLimiter;
 use App\Services\Notifications\NotificationGatewayResolver;
 use App\Services\Notifications\StageNotificationRetryOutboxMessage;
 use Illuminate\Database\QueryException;
@@ -30,6 +31,7 @@ class ProcessNotificationDeliveryMessage
         private readonly NotificationGatewayResolver $gatewayResolver,
         private readonly NotificationDeliveryRetryPolicy $retryPolicy,
         private readonly StageNotificationRetryOutboxMessage $stageRetryOutboxMessage,
+        private readonly NotificationGatewayRateLimiter $gatewayRateLimiter,
     ) {}
 
     public function __invoke(KafkaNotificationMessage $message): NotificationDeliveryProcessingResult
@@ -85,27 +87,13 @@ class ProcessNotificationDeliveryMessage
         }
 
         $gateway = $this->gatewayResolver->forChannel($notification->channel);
+        $gatewayName = $this->gatewayName($gateway);
 
         /** @var DeliveryAttempt|null $existingAttempt */
-        $existingAttempt = DeliveryAttempt::query()
-            ->where('notification_id', $notification->id)
-            ->where('attempt_number', $attemptNumber)
-            ->first();
+        $existingAttempt = $this->existingAttempt($notification, $attemptNumber);
 
         if ($existingAttempt !== null) {
-            Log::info('Notification delivery message skipped because delivery attempt already exists.', [
-                'topic' => $message->topic,
-                'notification_id' => $notification->id,
-                'attempt' => $attemptNumber,
-                'gateway' => $existingAttempt->gateway,
-                'existing_attempt_status' => $existingAttempt->status->value,
-            ]);
-
-            return new NotificationDeliveryProcessingResult(
-                status: NotificationDeliveryProcessingStatus::Consumed,
-                notificationId: $notification->id,
-                reason: 'duplicate_attempt',
-            );
+            return $this->duplicateAttemptResult($message, $notification, $existingAttempt, $attemptNumber);
         }
 
         $attempt = $this->createPendingAttempt($notification, $gateway, $attemptNumber);
@@ -118,21 +106,31 @@ class ProcessNotificationDeliveryMessage
             );
         }
 
-        try {
-            $gatewayResult = $gateway->send($notification);
-        } catch (Throwable $exception) {
-            Log::error('Notification gateway send threw an unexpected exception.', [
-                'notification_id' => $notification->id,
-                'attempt' => $attemptNumber,
-                'gateway_class' => $gateway::class,
-                'exception_class' => $exception::class,
-            ]);
+        $rateLimit = $this->gatewayRateLimiter->attempt($notification, $gatewayName);
 
+        if (! $rateLimit->allowed) {
             $gatewayResult = GatewayResult::temporaryFailure(
-                gatewayName: class_basename($gateway),
-                errorCode: 'gateway_exception',
-                errorMessage: $exception->getMessage(),
+                gatewayName: $gatewayName,
+                errorCode: 'gateway_rate_limited',
+                errorMessage: 'Gateway rate limit reached.',
             );
+        } else {
+            try {
+                $gatewayResult = $gateway->send($notification);
+            } catch (Throwable $exception) {
+                Log::error('Notification gateway send threw an unexpected exception.', [
+                    'notification_id' => $notification->id,
+                    'attempt' => $attemptNumber,
+                    'gateway_class' => $gateway::class,
+                    'exception_class' => $exception::class,
+                ]);
+
+                $gatewayResult = GatewayResult::temporaryFailure(
+                    gatewayName: $gatewayName,
+                    errorCode: 'gateway_exception',
+                    errorMessage: $exception->getMessage(),
+                );
+            }
         }
 
         $this->persistGatewayResult($notification, $attempt, $gatewayResult);
@@ -152,7 +150,7 @@ class ProcessNotificationDeliveryMessage
             /** @var DeliveryAttempt $attempt */
             $attempt = DeliveryAttempt::query()->create([
                 'notification_id' => $notification->id,
-                'gateway' => class_basename($gateway),
+                'gateway' => $this->gatewayName($gateway),
                 'status' => DeliveryAttemptStatus::Pending,
                 'attempt_number' => $attemptNumber,
             ]);
@@ -164,7 +162,7 @@ class ProcessNotificationDeliveryMessage
             Log::info('Notification delivery message skipped because delivery attempt already exists.', [
                 'notification_id' => $notification->id,
                 'attempt' => $attemptNumber,
-                'gateway' => class_basename($gateway),
+                'gateway' => $this->gatewayName($gateway),
                 'existing_attempt_status' => 'unknown',
             ]);
 
@@ -329,5 +327,42 @@ class ProcessNotificationDeliveryMessage
     private function isUniqueConstraintViolation(QueryException $exception): bool
     {
         return in_array($exception->getCode(), ['23000', '23505'], true);
+    }
+
+    private function existingAttempt(Notification $notification, int $attemptNumber): ?DeliveryAttempt
+    {
+        /** @var DeliveryAttempt|null $attempt */
+        $attempt = DeliveryAttempt::query()
+            ->where('notification_id', $notification->id)
+            ->where('attempt_number', $attemptNumber)
+            ->first();
+
+        return $attempt;
+    }
+
+    private function duplicateAttemptResult(
+        KafkaNotificationMessage $message,
+        Notification $notification,
+        DeliveryAttempt $existingAttempt,
+        int $attemptNumber,
+    ): NotificationDeliveryProcessingResult {
+        Log::info('Notification delivery message skipped because delivery attempt already exists.', [
+            'topic' => $message->topic,
+            'notification_id' => $notification->id,
+            'attempt' => $attemptNumber,
+            'gateway' => $existingAttempt->gateway,
+            'existing_attempt_status' => $existingAttempt->status->value,
+        ]);
+
+        return new NotificationDeliveryProcessingResult(
+            status: NotificationDeliveryProcessingStatus::Consumed,
+            notificationId: $notification->id,
+            reason: 'duplicate_attempt',
+        );
+    }
+
+    private function gatewayName(NotificationGateway $gateway): string
+    {
+        return class_basename($gateway);
     }
 }
