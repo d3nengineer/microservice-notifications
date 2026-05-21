@@ -57,11 +57,6 @@ class CreateNotificationBatch
                 fn (): NotificationBatchCreationResult => $this->createOrReplay($data, $payloadHash, $request),
             );
         } catch (LockTimeoutException) {
-            Log::warning('Idempotency lock acquisition timed out.', [
-                'idempotency_key' => $data->idempotencyKey,
-                'payload_hash' => $payloadHash,
-            ]);
-
             throw new IdempotencyLockTimeoutException($data->idempotencyKey, $payloadHash);
         } catch (Throwable $exception) {
             if ($exception instanceof IdempotencyConflictException) {

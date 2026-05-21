@@ -16,28 +16,12 @@ class NotificationDeliveryRetryPolicy
 
     public function shouldRetry(int $currentAttempt): bool
     {
-        $shouldRetry = ! $this->isExhausted($currentAttempt);
-
-        Log::info('Notification delivery retry decision computed.', [
-            'current_attempt' => $currentAttempt,
-            'max_attempts' => $this->maxAttempts(),
-            'should_retry' => $shouldRetry,
-        ]);
-
-        return $shouldRetry;
+        return ! $this->isExhausted($currentAttempt);
     }
 
     public function isExhausted(int $currentAttempt): bool
     {
-        $isExhausted = $currentAttempt >= $this->maxAttempts();
-
-        Log::info('Notification delivery retry exhaustion decision computed.', [
-            'current_attempt' => $currentAttempt,
-            'max_attempts' => $this->maxAttempts(),
-            'is_exhausted' => $isExhausted,
-        ]);
-
-        return $isExhausted;
+        return $currentAttempt >= $this->maxAttempts();
     }
 
     public function delaySecondsForAttempt(int $currentAttempt): int
