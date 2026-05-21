@@ -27,7 +27,7 @@ class NotificationConsumerCommandTest extends TestCase
 
     public function test_notifications_consume_command_processes_messages_in_priority_topic_order(): void
     {
-        $this->useFakeGateway();
+        $gateway = $this->useFakeGateway();
 
         config()->set('notifications.kafka.topics.high', 'custom.high');
         config()->set('notifications.kafka.topics.normal', 'custom.normal');
@@ -60,6 +60,10 @@ class NotificationConsumerCommandTest extends TestCase
             ->run();
 
         $this->assertSame(['custom.high', 'custom.normal', 'custom.low'], $consumer->consumedTopics());
+        $this->assertSame([
+            $highPriorityNotification->id,
+            $lowPriorityNotification->id,
+        ], $gateway->sentNotificationIds());
     }
 
     public function test_notifications_consume_command_counts_gateway_outcomes_as_consumed(): void

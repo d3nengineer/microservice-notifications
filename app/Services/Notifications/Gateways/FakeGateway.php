@@ -27,6 +27,11 @@ class FakeGateway implements NotificationGateway
      */
     private array $sendCountsByNotification = [];
 
+    /**
+     * @var array<int, int>
+     */
+    private array $sentNotificationIds = [];
+
     private GatewayResult $defaultResult;
 
     public function __construct(?GatewayResult $defaultResult = null)
@@ -37,6 +42,7 @@ class FakeGateway implements NotificationGateway
     public function send(Notification $notification): GatewayResult
     {
         $this->sendCountsByNotification[$notification->id] = $this->sendCount($notification->id) + 1;
+        $this->sentNotificationIds[] = $notification->id;
 
         $result = $this->notificationResults[$notification->id]
             ?? $this->channelResults[$notification->channel->value]
@@ -97,6 +103,14 @@ class FakeGateway implements NotificationGateway
     public function sendCount(int $notificationId): int
     {
         return $this->sendCountsByNotification[$notificationId] ?? 0;
+    }
+
+    /**
+     * @return array<int, int>
+     */
+    public function sentNotificationIds(): array
+    {
+        return $this->sentNotificationIds;
     }
 
     private function setChannelOrDefault(GatewayResult $result, ?NotificationChannel $channel): self
