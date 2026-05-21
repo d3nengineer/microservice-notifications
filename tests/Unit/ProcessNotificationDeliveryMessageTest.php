@@ -16,11 +16,16 @@ use App\Models\DeliveryAttempt;
 use App\Models\Notification;
 use App\Models\OutboxMessage;
 use App\Services\Notifications\Gateways\FakeGateway;
+use App\Services\Notifications\NotificationGatewayRateLimiter;
 use App\Services\Notifications\NotificationKafkaPayloadBuilder;
 use App\Services\Notifications\NotificationKafkaTopicResolver;
 use App\Services\Notifications\StageNotificationRetryOutboxMessage;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
+use Mockery;
+use Mockery\MockInterface;
+use Mockery\VerificationDirector;
 use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 use Tests\TestCase;
@@ -269,6 +274,62 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
         $this->assertDatabaseCount((new DeliveryAttempt)->getTable(), 1);
         $this->assertDatabaseCount((new OutboxMessage)->getTable(), 0);
         $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
+    }
+
+    public function test_it_treats_gateway_rate_limits_as_temporary_failures_without_calling_gateway(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-05-20 10:00:00'));
+        config()->set('notifications.cache.rate_limits.channels.email.max_attempts', 1);
+        config()->set('notifications.cache.rate_limits.channels.email.decay_seconds', 60);
+        config()->set('notifications.delivery.max_attempts', 3);
+        config()->set('notifications.delivery.backoff_seconds', 60);
+
+        $gateway = $this->useFakeGateway();
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->queued()->create([
+            'channel' => NotificationChannel::Email,
+        ]);
+
+        app(NotificationGatewayRateLimiter::class)->attempt($notification, 'FakeGateway');
+        /** @var MockInterface $logger */
+        $logger = Mockery::spy();
+        Log::swap($logger);
+
+        $result = app(ProcessNotificationDeliveryMessage::class)(new KafkaNotificationMessage(
+            topic: 'notifications.normal',
+            payload: $this->validPayload($notification),
+        ));
+
+        $this->assertTrue($result->isConsumed());
+        $this->assertSame(0, $gateway->sendCount($notification->id));
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $notification->id,
+            'gateway' => 'FakeGateway',
+            'status' => DeliveryAttemptStatus::TemporaryFailed->value,
+            'attempt_number' => 1,
+            'error_code' => 'gateway_rate_limited',
+        ]);
+        $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
+        $this->assertDatabaseHas((new OutboxMessage)->getTable(), [
+            'aggregate_type' => Notification::class,
+            'aggregate_id' => $notification->id,
+            'status' => OutboxMessageStatus::Pending->value,
+        ]);
+        $this->assertSame(2, OutboxMessage::query()->sole()->payload['attempt']);
+        /** @var VerificationDirector $rateLimitWarning */
+        $rateLimitWarning = $logger->shouldHaveReceived('warning', [
+            'Notification gateway rate limit reached.',
+            Mockery::type('array'),
+        ]);
+        $rateLimitWarning->once();
+
+        /** @var VerificationDirector $processorWarning */
+        $processorWarning = $logger->shouldHaveReceived('warning', [
+            'Notification gateway send skipped because rate limit was reached.',
+            Mockery::type('array'),
+        ]);
+        $processorWarning->once();
     }
 
     public function test_it_skips_notifications_in_final_statuses(): void

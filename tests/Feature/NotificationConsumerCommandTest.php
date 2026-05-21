@@ -8,6 +8,7 @@ use App\Contracts\KafkaConsumer;
 use App\DTO\GatewayResult;
 use App\DTO\KafkaNotificationMessage;
 use App\Enums\DeliveryAttemptStatus;
+use App\Enums\NotificationChannel;
 use App\Enums\NotificationStatus;
 use App\Enums\OutboxMessageStatus;
 use App\Models\DeliveryAttempt;
@@ -15,6 +16,7 @@ use App\Models\Notification;
 use App\Models\OutboxMessage;
 use App\Services\Kafka\FakeKafkaConsumer;
 use App\Services\Notifications\Gateways\FakeGateway;
+use App\Services\Notifications\NotificationGatewayRateLimiter;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Testing\PendingCommand;
 use Tests\TestCase;
@@ -134,7 +136,9 @@ class NotificationConsumerCommandTest extends TestCase
         $this->app->instance(KafkaConsumer::class, $consumer);
 
         /** @var Notification $notification */
-        $notification = Notification::factory()->create();
+        $notification = Notification::factory()->create([
+            'channel' => NotificationChannel::Email,
+        ]);
 
         $consumer->push(new KafkaNotificationMessage(
             topic: 'notifications.high',
@@ -210,7 +214,9 @@ class NotificationConsumerCommandTest extends TestCase
         $this->app->instance(KafkaConsumer::class, $consumer);
 
         /** @var Notification $notification */
-        $notification = Notification::factory()->create();
+        $notification = Notification::factory()->create([
+            'channel' => NotificationChannel::Email,
+        ]);
 
         DeliveryAttempt::factory()->succeeded()->create([
             'notification_id' => $notification->id,
@@ -235,6 +241,52 @@ class NotificationConsumerCommandTest extends TestCase
         $this->assertDatabaseCount((new DeliveryAttempt)->getTable(), 1);
         $this->assertDatabaseCount((new OutboxMessage)->getTable(), 0);
         $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
+    }
+
+    public function test_notifications_consume_command_counts_rate_limited_deliveries_as_consumed(): void
+    {
+        config()->set('notifications.cache.rate_limits.channels.email.max_attempts', 1);
+        config()->set('notifications.cache.rate_limits.channels.email.decay_seconds', 60);
+        config()->set('notifications.delivery.max_attempts', 3);
+
+        $gateway = $this->useFakeGateway();
+
+        $consumer = new FakeKafkaConsumer;
+        $this->app->instance(KafkaConsumer::class, $consumer);
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->create([
+            'channel' => NotificationChannel::Email,
+        ]);
+
+        app(NotificationGatewayRateLimiter::class)->attempt($notification, 'FakeGateway');
+
+        $consumer->push(new KafkaNotificationMessage(
+            topic: 'notifications.high',
+            payload: $this->validPayload($notification),
+            key: 'notification:'.$notification->id,
+        ));
+
+        $command = $this->artisan('notifications:consume', ['--limit' => 1, '--once' => true]);
+        $this->assertInstanceOf(PendingCommand::class, $command);
+
+        $command->expectsOutputToContain('Consumed notifications: 1 consumed, 0 skipped, 0 missing, 0 invalid.')
+            ->assertSuccessful()
+            ->run();
+
+        $this->assertSame(0, $gateway->sendCount($notification->id));
+        $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $notification->id,
+            'gateway' => 'FakeGateway',
+            'status' => DeliveryAttemptStatus::TemporaryFailed->value,
+            'error_code' => 'gateway_rate_limited',
+        ]);
+        $this->assertDatabaseHas((new OutboxMessage)->getTable(), [
+            'aggregate_type' => Notification::class,
+            'aggregate_id' => $notification->id,
+            'status' => OutboxMessageStatus::Pending->value,
+        ]);
     }
 
     public function test_notifications_consume_command_succeeds_when_topics_are_empty(): void

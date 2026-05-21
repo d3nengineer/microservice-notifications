@@ -34,4 +34,34 @@ return [
         'backoff_seconds' => (int) env('NOTIFICATION_DELIVERY_BACKOFF_SECONDS', 60),
         'max_backoff_seconds' => (int) env('NOTIFICATION_DELIVERY_MAX_BACKOFF_SECONDS', 900),
     ],
+
+    'cache' => [
+        'locks' => [
+            'store' => env('NOTIFICATION_LOCK_CACHE_STORE', 'redis'),
+            'ttl_seconds' => (int) env('NOTIFICATION_IDEMPOTENCY_LOCK_TTL_SECONDS', 10),
+            'block_seconds' => (int) env('NOTIFICATION_IDEMPOTENCY_LOCK_BLOCK_SECONDS', 3),
+        ],
+
+        'rate_limits' => [
+            'store' => env('NOTIFICATION_RATE_LIMIT_CACHE_STORE', 'redis'),
+            'prefix' => env('NOTIFICATION_RATE_LIMIT_PREFIX', 'notification-gateways'),
+
+            'channels' => [
+                'email' => [
+                    'max_attempts' => (int) env('NOTIFICATION_EMAIL_RATE_LIMIT_ATTEMPTS', 60),
+                    'decay_seconds' => (int) env('NOTIFICATION_EMAIL_RATE_LIMIT_DECAY_SECONDS', 60),
+                ],
+                'sms' => [
+                    'max_attempts' => (int) env('NOTIFICATION_SMS_RATE_LIMIT_ATTEMPTS', 30),
+                    'decay_seconds' => (int) env('NOTIFICATION_SMS_RATE_LIMIT_DECAY_SECONDS', 60),
+                ],
+            ],
+        ],
+
+        'history' => [
+            'enabled' => (bool) env('NOTIFICATION_HISTORY_CACHE_ENABLED', false),
+            'store' => env('NOTIFICATION_HISTORY_CACHE_STORE', 'redis'),
+            'ttl_seconds' => (int) env('NOTIFICATION_HISTORY_CACHE_TTL_SECONDS', 60),
+        ],
+    ],
 ];

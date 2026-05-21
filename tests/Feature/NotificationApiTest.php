@@ -12,6 +12,9 @@ use App\Models\IdempotencyKey;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
 use App\Models\OutboxMessage;
+use App\Services\Notifications\NotificationBatchIdempotencyLock;
+use Illuminate\Cache\Repository;
+use Illuminate\Contracts\Cache\Lock;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -147,8 +150,12 @@ class NotificationApiTest extends TestCase
     public function test_batch_creation_returns_locked_response_when_idempotency_lock_is_busy(): void
     {
         $idempotencyKey = 'request-locked-001';
-        $lock = Cache::lock('notification-batches:idempotency:'.hash('sha256', $idempotencyKey), 10);
-
+        $idempotencyLock = app(NotificationBatchIdempotencyLock::class);
+        /** @var Repository $repository */
+        $repository = Cache::store('array');
+        /** @phpstan-ignore-next-line Laravel cache repositories support atomic locks at runtime. */
+        $lock = $repository->lock($idempotencyLock->lockName($idempotencyKey), 10);
+        /** @var Lock $lock */
         $this->assertTrue($lock->get());
 
         try {
@@ -333,5 +340,45 @@ class NotificationApiTest extends TestCase
             ->assertJsonPath('meta.total', 3);
 
         $this->assertNotSame($oldest->id, $response->json('data.0.id'));
+    }
+
+    public function test_subscriber_history_cache_is_invalidated_when_batch_creates_new_notifications(): void
+    {
+        config()->set('notifications.cache.history.enabled', true);
+        config()->set('notifications.cache.history.store', 'array');
+
+        /** @var Notification $existing */
+        $existing = Notification::factory()->create([
+            'recipient_id' => 'subscriber-1',
+            'created_at' => now()->subMinute(),
+            'updated_at' => now()->subMinute(),
+        ]);
+
+        $firstResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => 'subscriber-1',
+        ]));
+
+        $firstResponse
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $existing->id);
+
+        $this->postJson(route('api.v1.notification-batches.store'), [
+            'channel' => NotificationChannel::Email->value,
+            'message' => 'Your verification code is 1234',
+            'recipient_ids' => ['subscriber-1'],
+            'priority' => NotificationPriority::Normal->value,
+        ], [
+            'Idempotency-Key' => 'request-history-cache-invalidation',
+        ])->assertCreated();
+
+        $secondResponse = $this->getJson(route('api.v1.subscribers.notifications.index', [
+            'recipientId' => 'subscriber-1',
+        ]));
+
+        $secondResponse
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonPath('meta.total', 2);
     }
 }
