@@ -95,7 +95,7 @@ class ProcessNotificationDeliveryMessage
         $existingAttempt = $this->existingAttempt($notification, $attemptNumber);
 
         if ($existingAttempt !== null) {
-            return $this->duplicateAttemptResult($message, $notification, $existingAttempt, $attemptNumber);
+            return $this->existingAttemptResult($message, $notification, $existingAttempt, $attemptNumber);
         }
 
         $attempt = $this->createPendingAttempt($notification, $gateway, $attemptNumber);
@@ -354,6 +354,61 @@ class ProcessNotificationDeliveryMessage
         return $attempt;
     }
 
+    private function existingAttemptResult(
+        KafkaNotificationMessage $message,
+        Notification $notification,
+        DeliveryAttempt $existingAttempt,
+        int $attemptNumber,
+    ): NotificationDeliveryProcessingResult {
+        if (
+            $existingAttempt->status === DeliveryAttemptStatus::Pending
+            && $this->pendingAttemptIsStale($existingAttempt)
+        ) {
+            return $this->recoverStalePendingAttempt($message, $notification, $existingAttempt, $attemptNumber);
+        }
+
+        return $this->duplicateAttemptResult($message, $notification, $existingAttempt, $attemptNumber);
+    }
+
+    private function pendingAttemptIsStale(DeliveryAttempt $attempt): bool
+    {
+        if ($attempt->updated_at === null) {
+            return false;
+        }
+
+        return $attempt->updated_at->lte(now()->subSeconds($this->pendingAttemptTimeoutSeconds()));
+    }
+
+    private function recoverStalePendingAttempt(
+        KafkaNotificationMessage $message,
+        Notification $notification,
+        DeliveryAttempt $attempt,
+        int $attemptNumber,
+    ): NotificationDeliveryProcessingResult {
+        $gatewayName = $attempt->gateway;
+        $gatewayResult = GatewayResult::temporaryFailure(
+            gatewayName: $gatewayName,
+            errorCode: 'stale_pending_attempt',
+            errorMessage: 'Delivery attempt stayed pending past the configured timeout.',
+        );
+
+        Log::warning('Notification stale pending delivery attempt is being recovered.', [
+            'topic' => $message->topic,
+            'notification_id' => $notification->id,
+            'attempt' => $attemptNumber,
+            'gateway' => $gatewayName,
+            'pending_attempt_timeout_seconds' => $this->pendingAttemptTimeoutSeconds(),
+        ]);
+
+        $this->persistGatewayResult($notification, $attempt, $gatewayResult);
+
+        return new NotificationDeliveryProcessingResult(
+            status: NotificationDeliveryProcessingStatus::Consumed,
+            notificationId: $notification->id,
+            reason: 'stale_pending_attempt_recovered',
+        );
+    }
+
     private function duplicateAttemptResult(
         KafkaNotificationMessage $message,
         Notification $notification,
@@ -373,6 +428,21 @@ class ProcessNotificationDeliveryMessage
             notificationId: $notification->id,
             reason: 'duplicate_attempt',
         );
+    }
+
+    private function pendingAttemptTimeoutSeconds(): int
+    {
+        $value = config('notifications.delivery.pending_attempt_timeout_seconds', 300);
+
+        if (is_int($value) && $value > 0) {
+            return $value;
+        }
+
+        if (is_numeric($value) && (int) $value > 0) {
+            return (int) $value;
+        }
+
+        return 300;
     }
 
     private function gatewayName(NotificationGateway $gateway): string

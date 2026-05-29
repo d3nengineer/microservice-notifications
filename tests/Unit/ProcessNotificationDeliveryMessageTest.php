@@ -276,6 +276,89 @@ class ProcessNotificationDeliveryMessageTest extends TestCase
         $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
     }
 
+    public function test_it_recovers_stale_pending_attempt_without_calling_gateway_again(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-05-20 10:00:00'));
+        config()->set('notifications.delivery.max_attempts', 3);
+        config()->set('notifications.delivery.backoff_seconds', 60);
+        config()->set('notifications.delivery.pending_attempt_timeout_seconds', 300);
+
+        $gateway = $this->useFakeGateway();
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->queued()->create();
+        /** @var DeliveryAttempt $attempt */
+        $attempt = DeliveryAttempt::factory()->create([
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::Pending,
+            'attempt_number' => 1,
+            'created_at' => Carbon::parse('2026-05-20 09:54:59'),
+            'updated_at' => Carbon::parse('2026-05-20 09:54:59'),
+        ]);
+
+        $result = app(ProcessNotificationDeliveryMessage::class)(new KafkaNotificationMessage(
+            topic: 'notifications.normal',
+            payload: $this->validPayload($notification),
+        ));
+
+        $this->assertTrue($result->isConsumed());
+        $this->assertSame('stale_pending_attempt_recovered', $result->reason);
+        $this->assertSame(0, $gateway->sendCount($notification->id));
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'id' => $attempt->id,
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::TemporaryFailed->value,
+            'attempt_number' => 1,
+            'error_code' => 'stale_pending_attempt',
+            'error_message' => 'Delivery attempt stayed pending past the configured timeout.',
+        ]);
+        $this->assertSame(NotificationStatus::Queued, $notification->refresh()->status);
+        $this->assertDatabaseHas((new OutboxMessage)->getTable(), [
+            'aggregate_type' => Notification::class,
+            'aggregate_id' => $notification->id,
+            'topic' => 'notifications.normal',
+            'status' => OutboxMessageStatus::Pending->value,
+        ]);
+        $this->assertSame(2, OutboxMessage::query()->sole()->payload['attempt']);
+    }
+
+    public function test_it_does_not_recover_fresh_pending_attempt(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-05-20 10:00:00'));
+        config()->set('notifications.delivery.pending_attempt_timeout_seconds', 300);
+
+        $gateway = $this->useFakeGateway();
+
+        /** @var Notification $notification */
+        $notification = Notification::factory()->queued()->create();
+        DeliveryAttempt::factory()->create([
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::Pending,
+            'attempt_number' => 1,
+            'created_at' => Carbon::parse('2026-05-20 09:59:00'),
+            'updated_at' => Carbon::parse('2026-05-20 09:59:00'),
+        ]);
+
+        $result = app(ProcessNotificationDeliveryMessage::class)(new KafkaNotificationMessage(
+            topic: 'notifications.normal',
+            payload: $this->validPayload($notification),
+        ));
+
+        $this->assertTrue($result->isConsumed());
+        $this->assertSame('duplicate_attempt', $result->reason);
+        $this->assertSame(0, $gateway->sendCount($notification->id));
+        $this->assertDatabaseHas((new DeliveryAttempt)->getTable(), [
+            'notification_id' => $notification->id,
+            'gateway' => 'fake',
+            'status' => DeliveryAttemptStatus::Pending->value,
+            'attempt_number' => 1,
+        ]);
+        $this->assertDatabaseCount((new OutboxMessage)->getTable(), 0);
+    }
+
     public function test_it_treats_gateway_rate_limits_as_temporary_failures_without_calling_gateway(): void
     {
         Carbon::setTestNow(Carbon::parse('2026-05-20 10:00:00'));
