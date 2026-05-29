@@ -33,6 +33,7 @@ return [
         'max_attempts' => (int) env('NOTIFICATION_DELIVERY_MAX_ATTEMPTS', 3),
         'backoff_seconds' => (int) env('NOTIFICATION_DELIVERY_BACKOFF_SECONDS', 60),
         'max_backoff_seconds' => (int) env('NOTIFICATION_DELIVERY_MAX_BACKOFF_SECONDS', 900),
+        'pending_attempt_timeout_seconds' => (int) env('NOTIFICATION_DELIVERY_PENDING_ATTEMPT_TIMEOUT_SECONDS', 300),
     ],
 
     'cache' => [
